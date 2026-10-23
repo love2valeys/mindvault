@@ -17,6 +17,7 @@ restart. Secret keys are never shown in tool output.
 | `mindvault_use_profile`   | Switch the active profile (`name` required), creating it if it does not exist.                                                                                                            |
 | `mindvault_list_profiles` | List all profiles, marking the active one and showing each wallet address and registration state.                                                                                         |
 | `mindvault_wallet_info`   | Show the active profile name, wallet address, USDC balance, and whether it is registered.                                                                                                 |
+| `mindvault_wallet_balances` | Show wallet balances with the active profile's estimated pending spend and configured automatic USDC payment ceiling.                                                                    |
 | `mindvault_reset`         | Clear the active profile's credentials, or pass `all=true` to remove every profile and delete state. Requires `confirm=true` — see [Reset confirmation guard](#reset-confirmation-guard). |
 | `mindvault_backup_state`  | Export an encrypted backup of `~/.mindvault/state.json` (passphrase min 8 chars). No plaintext secrets in the blob.                                                                       |
 | `mindvault_restore_state` | Restore state from a `mindvault_backup_state` blob. Integrity-checked before any write.                                                                                                   |
@@ -57,8 +58,19 @@ it stores. That is checked at both boundaries where a keypair can enter:
   line — and `ownsAddress: false` in its structured output — when they disagree,
   so a balance for an unsignable address never reads as spendable funds.
 
-`mindvault_import_wallet` derives the address from the secret it is given, so an
-imported wallet is consistent by construction.
+`mindvault_import_wallet` first verifies a key and reports its derived address,
+profile, and configured network without writing. Persist it only in a second call
+with `persist: true`, the same `profile` and `network`, and
+`confirmAddress` equal to the displayed address. The selected network must match
+the configured Stellar network. Secret parsing errors never include SDK error
+text, and the secret is never returned.
+
+`mindvault_wallet_balances` reports an estimated pending spend for the active
+profile using current public resource prices for pending idempotent purchases.
+The estimate is labeled and returns `null` if any pending attempt cannot be
+priced or the lookup cap is exceeded; it does not understate unknown amounts.
+The summary also identifies the Stellar network, USDC balance, and configured
+automatic payment ceiling. It performs reads only and never signs or transfers.
 
 ## Reset confirmation guard
 

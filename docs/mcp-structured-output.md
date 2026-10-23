@@ -15,6 +15,12 @@ This follows the MCP 2025-06-18
 contract: a tool that declares `outputSchema` must return conforming
 `structuredContent` on success.
 
+The server validates each structured success immediately before sending it.
+Contract mismatches are logged with the tool name and schema paths only; the
+handler payload is not logged or returned. An invalid or missing structured
+result becomes a generic tool error. Failures do not include `structuredContent`
+unless it conforms to the success schema.
+
 ## Result contract
 
 **Success, structured tool:**

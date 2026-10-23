@@ -111,11 +111,82 @@ pub fn repair_index(env: Env, ids: Vec<String>) -> Result<(), Error>
   as a follow-up since nothing currently exercises a path that could corrupt
   it.
 
+## Resumable chunked repair (`repair_index_chunk`)
+
+`repair_index` validates and rewrites the whole index in one transaction, which
+is exactly the right shape for small and medium registries but becomes an
+oversized transaction as the resource count grows: validation alone is
+quadratic in the list length, and every `Index` write plus the TTL bumps land
+in a single invocation. `repair_index_chunk` splits the same repair into
+bounded, resumable calls:
+
+```rust
+pub fn repair_index_chunk(env: Env, ids: Vec<String>, cursor: u32) -> Result<u32, Error>
+```
+
+- **Same authority and boundary**: admin-gated, refused while paused, never
+  reads `Resource` for content, never writes or deletes it. Only the derived
+  `Index`/`Count` pair moves, exactly like `repair_index`.
+- **Input**: `ids` is the _next slice_ of the same authoritative ordered list
+  an operator would hand `repair_index`, at most `REPAIR_INDEX_CHUNK_CAP` (50)
+  entries (else `BatchTooLarge`). Sending only the slice — not the whole list
+  — is what keeps each transaction's arguments bounded on large registries.
+- **Cursor semantics**: the chunk is written to
+  `Index(cursor..cursor + ids.len())` and `Count` is set to
+  `cursor + ids.len()`; the returned `u32` is the cursor for the next call.
+  The loop is therefore: slice the authoritative list, call with the first
+  slice at cursor `0`, then keep passing the returned cursor until the whole
+  list is consumed.
+- **Explicit, persisted progress**: `Count` after each successful call _is_
+  the resume point. If a call fails (bad id, duplicate, pause, transport
+  error) nothing is written, so an interrupted repair re-runs from the last
+  returned cursor — or from `0` to replay the whole list, which stays safe
+  because the rewrite is idempotent.
+- **Contiguity invariant**: `cursor` must not exceed the current `Count`
+  (else `InvalidRepairCursor`). That rule guarantees a chunk can only write
+  at positions already covered by a previously validated prefix or extend it,
+  so a stale or misordered cursor can never make `list` serve an index slot
+  the repair did not write.
+- **Per-chunk validation**: each chunk gets the same first-pass validation
+  `repair_index` applies to its whole input — every id must exist
+  (`NotFound`) and a chunk must not contain duplicates
+  (`DuplicateInRepair`) — so a bad chunk fails atomically without moving the
+  cursor. Duplicates spanning two _different_ chunks cannot be detected
+  on-chain; the operator must de-duplicate the authoritative list off-chain
+  before slicing it, which the sourcing path (event replay, `pnpm reconcile`)
+  already produces.
+- **Events**: one `reindex` event per non-empty chunk — the count before the
+  chunk in the topic, the count after it (the returned cursor) as data — so
+  the audit trail uses the same topic as the atomic repair and records
+  incremental progress. An empty chunk is a silent no-op: no writes, cursor
+  returned unchanged, no event (the same "no event means no repair" rule
+  `repair_tag_index` follows).
+
+### Chunked-repair caveats
+
+- `Count` can shrink mid-repair: while rebuilding a catalog to a shorter
+  list, readers temporarily see only the validated prefix written so far.
+  This is the same end state the atomic repair would produce, just visible
+  between chunks.
+- Keep registration traffic off the catalog (or re-run the full repair
+  afterwards) while a chunked rebuild is in flight: `register` appends at the
+  then-current `Count`, so a registration interleaved between two chunks is
+  overwritten by the next chunk's slice. The atomic `repair_index` has the
+  same race window; chunking only makes the window longer.
+- `repair_tag_index` remains single-shot on purpose: a tag index cannot be
+  extended chunk-by-chunk without re-reading the existing per-tag vectors,
+  and its cost profile (one existence check and one `Resource` read per id)
+  does not have `repair_index`'s quadratic validation problem.
+
 ## Tests
 
-See `repair_index_*` tests in
+See `repair_index_*` and `repair_index_chunk_*` tests in
 [`contract/contracts/vault-registry/src/test.rs`](../contract/contracts/vault-registry/src/test.rs):
 rebuilding from an authoritative list (including dropping an id from the
 index while it stays readable via `get`), rejecting an unknown id with no
 partial write, rejecting duplicate ids, requiring an admin first, and
-re-running the current list as a safe no-op.
+re-running the current list as a safe no-op. The chunked variant additionally
+covers bounded multi-call rebuilds with explicit cursor hand-off, resuming
+from the last returned cursor after a failed chunk, rejecting a cursor past
+`Count`, rejecting an oversized chunk, empty-chunk no-ops, shrinking `Count`
+to a shorter list, and the emergency-pause gate.

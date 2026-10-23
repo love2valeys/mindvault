@@ -139,6 +139,12 @@ describe("createProgressEmitter", () => {
     await emit(4, 4, "d");
 
     expect(send).toHaveBeenCalledTimes(4);
+    expect(send.mock.calls.map(([notification]) => notification.params._meta)).toEqual([
+      { "mindvault/progressSequence": 1 },
+      { "mindvault/progressSequence": 2 },
+      { "mindvault/progressSequence": 3 },
+      { "mindvault/progressSequence": 4 },
+    ]);
   });
 });
 

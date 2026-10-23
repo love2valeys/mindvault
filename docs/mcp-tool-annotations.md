@@ -20,18 +20,27 @@ the advertised surface and the definition list cannot drift apart.
 | ----------------- | ---------------------------------------------------------------- |
 | `title`           | Human-readable tool title shown in client UIs.                   |
 | `readOnlyHint`    | `true` when the tool performs no state changes or side effects.  |
-| `destructiveHint` | `true` when the tool can irreversibly destroy local state.       |
+| `destructiveHint` | `true` when the tool may perform destructive updates.             |
 | `idempotentHint`  | `true` when repeating the tool with identical arguments is safe. |
 
 ## What to expect
 
-- **Read-only tools** (`mindvault_browse`, `mindvault_search`,
-  `mindvault_preview`, `mindvault_wallet_info`, registry reads, verifications…)
+- **Read-only tools** (`mindvault_preview`, `mindvault_wallet_info`, registry
+  reads, verifications…)
   set `readOnlyHint: true` and are never `destructiveHint`.
-- **Destructive tools** (`mindvault_reset`, `mindvault_restore_state`) set
+- **Destructive tools** (`mindvault_reset`, `mindvault_restore_state`,
+  `mindvault_freeze`) set
   `destructiveHint: true` and are never `readOnlyHint`.
 - **Mutating but non-destructive tools** (publish, buy, register, on-chain
   mutations…) are neither read-only nor destructive; many are not idempotent.
+- Local writes count as side effects too: encrypted state backups and cache
+  prewarming are not read-only, even though they do not mutate the registry.
+  `mindvault_browse` and `mindvault_search` also write the offline catalog
+  snapshot used by their transport-failure fallback.
+- `toolMetadata.test.ts` keeps an exhaustive side-effect classification for
+  every tool, including payments and indirect local/cache writes, and verifies
+  it against all three advertised hints. Tools that create backup files or
+  reset metrics are marked non-idempotent because repeating them changes state.
 - `mindvault_publish_status` and `mindvault_purchase_history` validate their
   arguments inside the handler, so their annotations are declared alongside the
   advertised surface in `index.ts` rather than in `TOOL_DEFINITIONS`.

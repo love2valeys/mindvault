@@ -69,6 +69,7 @@ export function groupOf(name: string): string {
   if (
     [
       "mindvault_registry_info",
+      "mindvault_contract_preflight",
       "mindvault_registry_lookup",
       "mindvault_registry_list",
       "mindvault_registry_health",
@@ -154,6 +155,11 @@ export function renderToolReference(tools: readonly ToolDefinition[]): string {
     "[mcp-client-configs.md](mcp-client-configs.md).",
     "",
     `**${tools.length} tools** as of last generation.`,
+    "",
+    "> **Read-only mode:** when `MINDVAULT_READ_ONLY` is set, mutating tools",
+    "> (`mindvault_buy`, `mindvault_setup_wallet`, `mindvault_use_profile`, …) are not",
+    "> advertised by ListTools and are refused on dispatch. Treat them as unavailable",
+    "> in this listing rather than planning around a later \"not available\" error (#845).",
     "",
     "---",
     "",

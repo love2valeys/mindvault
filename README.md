@@ -256,8 +256,44 @@ MIT
 
 ## Handsoff notes
 
+<!-- handsoff-issue-124 -->
+- #124: [MCP] [Bug] Enforce outbound URL allowlists for metadata and content verification
+
+<!-- handsoff-issue-125 -->
+- #125: [MCP] [Feature] Add export format option for receipt history
+<!-- handsoff-issue-25 -->
+- #25: [Contract] [Bug] Prevent expired pause deadlines from reactivating after timestamp rollback
+<!-- handsoff-issue-3 -->
+- #3: [MCP] [Bug] paymentCeiling applies to buy but not to register_onchain / metadata mutations
+
+<!-- handsoff-issue-6 -->
+- #6: [MCP] [Bug] toolTimeoutOverrides applies to publish but not to export_receipts on huge histories
+<!-- handsoff-issue-19 -->
+- #19: [Contract] [Bug] Keep creator listed counts consistent across pause and lifecycle transitions
+
+<!-- handsoff-issue-20 -->
+- #20: [Contract] [Feature] Add bounded resource search by normalized tag prefix
+<!-- handsoff-issue-11 -->
+- #11: [Contract] [Bug] Make cursor pagination stable when resources are tombstoned
+
+<!-- handsoff-issue-13 -->
+- #13: [Contract] [Bug] Reject duplicate IDs within a single register_batch call
+
+<!-- handsoff-issue-14 -->
+- #14: [Contract] [Feature] Add batch metadata-pointer updates with per-item results
+<!-- handsoff-issue-7 -->
+- #7: [MCP] [Bug] state backup restore accepts a file that belongs to another network profile
+
+<!-- handsoff-issue-8 -->
+- #8: [Contract] [Feature] Add versioned resource migrations with explicit upgrade guards
+
+<!-- handsoff-issue-9 -->
+- #9: [Contract] [Bug] Prevent stale creator indexes after repeated ownership transfers
 <!-- handsoff-issue-15 -->
 - #15: [Contract] [Bug] Ensure metadata freeze cannot be bypassed through batch setters
 
 <!-- handsoff-issue-18 -->
 - #18: [Contract] [Feature] Add creator-scoped listing page with listed and lifecycle filters
+
+<!-- handsoff-issue-42 -->
+- #42: [Contract] [Bug] Enforce bounded retry windows for anchor recovery paths

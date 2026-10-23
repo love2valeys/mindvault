@@ -65,6 +65,11 @@ that want to branch on the failure rather than parse prose.
 | ------------------------------ | ---------------------- | -------- | --------------------------------------------------------- |
 | `mindvault_setup_wallet`       | `profile`              | no       | letters, digits, dot, dash, underscore (1–64)             |
 | `mindvault_wallet_info`        | —                      | —        | takes no arguments                                        |
+| `mindvault_import_wallet`     | `secretKey`            | no       | Stellar secret seed; omitted uses `MINDVAULT_AGENT_SECRET` |
+|                                | `profile`              | no       | explicit target profile; required when persisting         |
+|                                | `network`              | no       | `testnet` or `mainnet`; must match configured network      |
+|                                | `confirmAddress`       | no       | exact derived public address; required when persisting     |
+|                                | `persist`              | no       | false previews; true requires the confirmation values      |
 | `mindvault_use_profile`        | `name`                 | yes      | letters, digits, dot, dash, underscore (1–64)             |
 | `mindvault_list_profiles`      | —                      | —        | takes no arguments                                        |
 | `mindvault_browse`             | `query`                | no       | keyword search; matches title or description              |
@@ -84,7 +89,7 @@ that want to branch on the failure rather than parse prose.
 | `mindvault_preview`            | `resourceId`           | yes      | letters, digits, dot, dash, underscore (≤128)             |
 | `mindvault_register`           | `name`                 | yes      | 1–128 characters                                          |
 |                                | `email`                | yes      | email address (≤254)                                      |
-|                                | `walletAddress`        | no       | Stellar public key (`G…`, 56 chars)                       |
+|                                | `walletAddress`        | no       | Checksum-valid Stellar public key (`G…`, 56 chars)        |
 | `mindvault_publish`            | `title`                | yes      | 1–256 characters                                          |
 |                                | `description`          | no       | ≤2048 characters                                          |
 |                                | `price`                | yes      | decimal USDC string                                       |
@@ -97,12 +102,13 @@ that want to branch on the failure rather than parse prose.
 | `mindvault_set_price`          | `resourceId`           | yes      | resource id                                               |
 |                                | `price`                | yes      | decimal USDC amount (e.g. `"10.00"`)                      |
 | `mindvault_transfer_ownership` | `resourceId`           | yes      | resource id                                               |
-|                                | `newCreator`           | yes      | Stellar public key (`G…`, 56 chars)                       |
+|                                | `newCreator`           | yes      | Checksum-valid Stellar public key (`G…`, 56 chars)        |
 | `mindvault_set_listed`         | `resourceId`           | yes      | resource id                                               |
 |                                | `listed`               | yes      | boolean (`true`/`false`)                                  |
 | `mindvault_agent_status`       | —                      | —        | takes no arguments                                        |
 | `mindvault_registry_info`      | —                      | —        | takes no arguments                                        |
 | `mindvault_network_profile`    | —                      | —        | takes no arguments                                        |
+| `mindvault_wallet_balances`    | —                      | —        | balances and read-only spend summary                      |
 | `mindvault_check_bindings`     | —                      | —        | takes no arguments                                        |
 | `mindvault_verify_install`     | —                      | —        | takes no arguments                                        |
 | `mindvault_check_consistency`  | `resourceId`           | yes      | resource id                                               |

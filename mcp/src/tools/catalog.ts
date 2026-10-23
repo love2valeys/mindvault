@@ -14,6 +14,7 @@ import {
   recordPreviewSnapshot,
   type CatalogFallbackReason,
 } from "../catalogCache.js";
+import { currentCatalogCacheScope } from "../catalogCacheScope.js";
 import { isRetryableStatus } from "../retry.js";
 import { mappedErrorOf } from "../errorMapping.js";
 import { cacheStalenessNotice } from "../cacheStaleness.js";
@@ -27,6 +28,9 @@ interface CatalogLoad {
   notice: string | null;
   fromCache: boolean;
 }
+
+const catalogLoads = new Map<string, Promise<CatalogLoad>>();
+const previewLoads = new Map<string, Promise<{ r: any; label: string | null }>>();
 
 /**
  * Whether a failed catalog read should fall back to the offline snapshot (#837).
@@ -47,7 +51,7 @@ function catalogFallbackFor(err: unknown): CatalogFallbackReason | null {
   return isRetryableStatus(mapped.status) ? { kind: "status", status: mapped.status } : null;
 }
 
-async function loadCatalog(url: string, operation: string): Promise<CatalogLoad> {
+async function fetchCatalog(url: string, operation: string, scope: string): Promise<CatalogLoad> {
   try {
     const res = await jsonFetch(url);
     if (!res.ok) {
@@ -56,11 +60,11 @@ async function loadCatalog(url: string, operation: string): Promise<CatalogLoad>
       );
     }
     const items = Array.isArray(res.data) ? res.data : [];
-    recordCatalogSnapshot(items);
+    recordCatalogSnapshot(items, scope);
     return { items, notice: cacheStalenessNotice(res.headers), fromCache: false };
   } catch (err) {
     const reason = catalogFallbackFor(err);
-    const snapshot = reason ? getCatalogSnapshot() : null;
+    const snapshot = reason ? getCatalogSnapshot(Date.now(), scope) : null;
     if (!snapshot || !reason) throw err;
     return {
       items: Array.isArray(snapshot.resources) ? (snapshot.resources as any[]) : [],
@@ -68,6 +72,25 @@ async function loadCatalog(url: string, operation: string): Promise<CatalogLoad>
       fromCache: true,
     };
   }
+}
+
+function loadCatalog(url: string, operation: string): Promise<CatalogLoad> {
+  const scope = currentCatalogCacheScope();
+  const key = `${scope}\u0000${url}`;
+  const pending = catalogLoads.get(key);
+  if (pending) return pending;
+
+  const request = fetchCatalog(url, operation, scope);
+  catalogLoads.set(key, request);
+  void request.then(
+    () => {
+      if (catalogLoads.get(key) === request) catalogLoads.delete(key);
+    },
+    () => {
+      if (catalogLoads.get(key) === request) catalogLoads.delete(key);
+    },
+  );
+  return request;
 }
 
 export async function browse(filters: CatalogFilters = {}): Promise<string> {
@@ -122,7 +145,10 @@ export async function search(filtersOrQuery: string | CatalogFilters): Promise<s
   return truncateResponse(full);
 }
 
-async function previewData(resourceId: string): Promise<{ r: any; label: string | null }> {
+async function fetchPreviewData(
+  resourceId: string,
+  scope: string,
+): Promise<{ r: any; label: string | null }> {
   try {
     const res = await jsonFetch(`${BASE_URL}/resources/${resourceId}/meta`);
     if (!res.ok)
@@ -132,14 +158,33 @@ async function previewData(resourceId: string): Promise<{ r: any; label: string 
         status: res.status,
         data: res.data,
       });
-    recordPreviewSnapshot(resourceId, res.data);
+    recordPreviewSnapshot(resourceId, res.data, scope);
     return { r: res.data, label: null };
   } catch (err) {
     const reason = catalogFallbackFor(err);
-    const snap = reason ? getPreviewSnapshot(resourceId) : null;
+    const snap = reason ? getPreviewSnapshot(resourceId, Date.now(), scope) : null;
     if (!snap || !reason) throw err;
     return { r: snap.meta as any, label: catalogCacheLabel(snap.savedAtMs, Date.now(), reason) };
   }
+}
+
+function previewData(resourceId: string): Promise<{ r: any; label: string | null }> {
+  const scope = currentCatalogCacheScope();
+  const key = `${scope}\u0000${resourceId}`;
+  const pending = previewLoads.get(key);
+  if (pending) return pending;
+
+  const request = fetchPreviewData(resourceId, scope);
+  previewLoads.set(key, request);
+  void request.then(
+    () => {
+      if (previewLoads.get(key) === request) previewLoads.delete(key);
+    },
+    () => {
+      if (previewLoads.get(key) === request) previewLoads.delete(key);
+    },
+  );
+  return request;
 }
 
 export async function preview(resourceId: string): Promise<string> {

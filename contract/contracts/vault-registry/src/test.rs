@@ -5,7 +5,8 @@ use alloc::{format, string::ToString};
 use proptest::prelude::*;
 use soroban_sdk::{
     testutils::{
-        storage::Persistent as _, Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke,
+        storage::{Instance as _, Persistent as _}, Address as _, Events as _, Ledger as _,
+        MockAuth, MockAuthInvoke,
     },
     Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal, Val, Vec,
 };
@@ -6467,6 +6468,150 @@ fn repair_index_rerunning_current_list_is_a_safe_noop() {
     assert_eq!(page.get(1).unwrap().id, b);
 }
 
+// ─── Resumable chunked index repair (#58) ──────────────────────────────────
+
+#[test]
+fn repair_index_chunk_rebuilds_in_bounded_steps() {
+    let (env, creator, _admin, client) = setup_with_admin();
+    let a = register_default(&env, &creator, &client, "rchnk0a");
+    let b = register_default(&env, &creator, &client, "rchnk0b");
+    let c = register_default(&env, &creator, &client, "rchnk0c");
+    let d = register_default(&env, &creator, &client, "rchnk0d");
+
+    // Each call writes one bounded chunk and returns the cursor for the
+    // next call — explicit progress with no unbounded single transaction.
+    let next = client.repair_index_chunk(&Vec::from_array(&env, [d.clone(), a.clone()]), &0u32);
+    assert_eq!(next, 2);
+    assert_eq!(client.count(), 2);
+    let page = client.list(&0u32, &10u32);
+    assert_eq!(page.get(0).unwrap().id, d);
+    assert_eq!(page.get(1).unwrap().id, a);
+
+    let next = client.repair_index_chunk(&Vec::from_array(&env, [c.clone(), b.clone()]), &next);
+    assert_eq!(next, 4);
+    assert_eq!(client.count(), 4);
+    let page = client.list(&0u32, &10u32);
+    assert_eq!(page.get(0).unwrap().id, d);
+    assert_eq!(page.get(1).unwrap().id, a);
+    assert_eq!(page.get(2).unwrap().id, c);
+    assert_eq!(page.get(3).unwrap().id, b);
+}
+
+#[test]
+fn repair_index_chunk_resumes_from_returned_cursor_after_failure() {
+    let (env, creator, _admin, client) = setup_with_admin();
+    let a = register_default(&env, &creator, &client, "rchnk1a");
+    let b = register_default(&env, &creator, &client, "rchnk1b");
+    let c = register_default(&env, &creator, &client, "rchnk1c");
+
+    let next = client.repair_index_chunk(&Vec::from_array(&env, [c.clone(), a.clone()]), &0u32);
+    assert_eq!(next, 2);
+
+    // A failed chunk moves neither the index nor `Count` (the persisted
+    // cursor), so an interrupted repair resumes from the last cursor.
+    let res = client.try_repair_index_chunk(
+        &Vec::from_array(&env, [String::from_str(&env, "ghost"), b.clone()]),
+        &next,
+    );
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+    assert_eq!(client.count(), 2);
+
+    let next = client.repair_index_chunk(&Vec::from_array(&env, [b.clone()]), &next);
+    assert_eq!(next, 3);
+    assert_eq!(client.count(), 3);
+    let page = client.list(&0u32, &10u32);
+    assert_eq!(page.get(0).unwrap().id, c);
+    assert_eq!(page.get(1).unwrap().id, a);
+    assert_eq!(page.get(2).unwrap().id, b);
+}
+
+#[test]
+fn repair_index_chunk_rejects_cursor_past_count() {
+    let (env, creator, _admin, client) = setup_with_admin();
+    let a = register_default(&env, &creator, &client, "rchnk2a");
+
+    let res = client.try_repair_index_chunk(&Vec::from_array(&env, [a.clone()]), &2u32);
+    assert_eq!(res, Err(Ok(Error::InvalidRepairCursor)));
+    assert_eq!(client.count(), 1);
+    assert_eq!(client.list(&0u32, &10u32).get(0).unwrap().id, a);
+}
+
+#[test]
+fn repair_index_chunk_rejects_oversized_chunk() {
+    let (env, creator, _admin, client) = setup_with_admin();
+    let a = register_default(&env, &creator, &client, "rchnk3a");
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..(REPAIR_INDEX_CHUNK_CAP + 1) {
+        ids.push_back(a.clone());
+    }
+    let res = client.try_repair_index_chunk(&ids, &0u32);
+    assert_eq!(res, Err(Ok(Error::BatchTooLarge)));
+    assert_eq!(client.count(), 1);
+}
+
+#[test]
+fn repair_index_chunk_rejects_unknown_id_without_partial_write() {
+    let (env, creator, _admin, client) = setup_with_admin();
+    let a = register_default(&env, &creator, &client, "rchnk4a");
+
+    let res = client.try_repair_index_chunk(
+        &Vec::from_array(&env, [a.clone(), String::from_str(&env, "ghost")]),
+        &0u32,
+    );
+    assert_eq!(res, Err(Ok(Error::NotFound)));
+    // No partial write: the chunk is validated before any slot moves.
+    assert_eq!(client.count(), 1);
+    assert_eq!(client.list(&0u32, &10u32).get(0).unwrap().id, a);
+}
+
+#[test]
+fn repair_index_chunk_rejects_duplicates() {
+    let (env, creator, _admin, client) = setup_with_admin();
+    let a = register_default(&env, &creator, &client, "rchnk5a");
+
+    let res = client.try_repair_index_chunk(&Vec::from_array(&env, [a.clone(), a.clone()]), &0u32);
+    assert_eq!(res, Err(Ok(Error::DuplicateInRepair)));
+    assert_eq!(client.count(), 1);
+}
+
+#[test]
+fn repair_index_chunk_empty_chunk_is_a_silent_noop() {
+    let (env, creator, _admin, client) = setup_with_admin();
+    let a = register_default(&env, &creator, &client, "rchnk6a");
+
+    let next = client.repair_index_chunk(&Vec::new(&env), &1u32);
+    assert_eq!(next, 1);
+    assert_eq!(client.count(), 1);
+    assert_eq!(client.list(&0u32, &10u32).get(0).unwrap().id, a);
+}
+
+#[test]
+fn repair_index_chunk_can_shrink_count_to_a_shorter_list() {
+    let (env, creator, _admin, client) = setup_with_admin();
+    let a = register_default(&env, &creator, &client, "rchnk7a");
+    let b = register_default(&env, &creator, &client, "rchnk7b");
+    let c = register_default(&env, &creator, &client, "rchnk7c");
+
+    let next = client.repair_index_chunk(&Vec::from_array(&env, [a.clone()]), &0u32);
+    assert_eq!(next, 1);
+    assert_eq!(client.count(), 1);
+    assert_eq!(client.list(&0u32, &10u32).get(0).unwrap().id, a);
+    // Dropped resources stay directly addressable — repair only rewrites
+    // the derived index, exactly like the atomic variant.
+    assert!(client.exists(&b));
+    assert!(client.exists(&c));
+}
+
+#[test]
+fn repair_index_chunk_before_admin_set_fails() {
+    let (env, creator, client) = setup();
+    let a = register_default(&env, &creator, &client, "rchnk8a");
+
+    let res = client.try_repair_index_chunk(&Vec::from_array(&env, [a.clone()]), &0u32);
+    assert_eq!(res, Err(Ok(Error::AdminNotSet)));
+}
+
 // ---------------------------------------------------------------------------
 // Issue 1 — MAX_METADATA_POINTER_LEN boundary hardening
 // ---------------------------------------------------------------------------
@@ -8459,6 +8604,15 @@ fn pause_blocks_repair_index() {
     let id = register_default(&env, &creator, &client, "pausedrepair");
     client.set_paused(&admin, &true);
     let res = client.try_repair_index(&Vec::from_array(&env, [id.clone()]));
+    assert_eq!(res, Err(Ok(Error::ContractPaused)));
+}
+
+#[test]
+fn pause_blocks_repair_index_chunk() {
+    let (env, creator, admin, client) = setup_with_admin();
+    let id = register_default(&env, &creator, &client, "pausedrchunk");
+    client.set_paused(&admin, &true);
+    let res = client.try_repair_index_chunk(&Vec::from_array(&env, [id.clone()]), &0u32);
     assert_eq!(res, Err(Ok(Error::ContractPaused)));
 }
 
@@ -11351,6 +11505,7 @@ include!("test/admin_nomination_cancel.rs");
 include!("test/recovery_target_check.rs");
 include!("test/lifecycle_events.rs");
 include!("test/storage_footprint.rs");
+include!("test/fee_split_preview.rs");
 
 include!("test/auth_fixtures.rs");
 include!("test/tombstone_read.rs");
@@ -11361,8 +11516,13 @@ include!("test/capability_version.rs");
 include!("test/anchor_status.rs");
 include!("test/flag_details.rs");
 include!("test/payment_idempotency.rs");
+include!("test/partial_refunds.rs");
 include!("test/stellar_wave_804_805_806_808.rs");
 include!("test/leases.rs");
+include!("test/lease_fee_protection.rs");
 include!("test/cursor_paging.rs");
 include!("test/payment_listing.rs");
 include!("test/anchor_backoff.rs");
+include!("test/fee_rounding_proptest.rs");
+include!("test/storage_ttl_mutations.rs");
+include!("test/payment_pause_matrix.rs");

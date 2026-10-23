@@ -1984,12 +1984,24 @@ exports[`tool schema snapshots > mindvault_import_wallet > annotations 1`] = `
 exports[`tool schema snapshots > mindvault_import_wallet > input schema 1`] = `
 {
   "properties": {
+    "confirmAddress": {
+      "description": "Exact public address returned by the verification call; required to persist.",
+      "type": "string",
+    },
     "confirmMainnet": {
       "description": "Required on mainnet (or set MINDVAULT_ALLOW_MAINNET=1). Explicitly confirm this mutation on the public Stellar network.",
       "type": "boolean",
     },
+    "network": {
+      "description": "Stellar network to bind to the profile. Must match the configured network to persist.",
+      "enum": [
+        "testnet",
+        "mainnet",
+      ],
+      "type": "string",
+    },
     "persist": {
-      "description": "When true (default), save the imported wallet to the state file. When false, validate only and return the public key without writing to disk.",
+      "description": "When true, save only after profile, network, and confirmAddress are explicitly supplied. Defaults to false for a verification-only preview.",
       "examples": [
         true,
         false,
@@ -1997,7 +2009,7 @@ exports[`tool schema snapshots > mindvault_import_wallet > input schema 1`] = `
       "type": "boolean",
     },
     "profile": {
-      "description": "Optional profile name to import into. Defaults to the active profile.",
+      "description": "Profile name to import into. Required when persist is true.",
       "examples": [
         "testnet",
         "mainnet-publisher",
@@ -2023,6 +2035,9 @@ exports[`tool schema snapshots > mindvault_import_wallet > output schema 1`] = `
     "address": {
       "type": "string",
     },
+    "network": {
+      "type": "string",
+    },
     "persisted": {
       "type": "boolean",
     },
@@ -2033,6 +2048,7 @@ exports[`tool schema snapshots > mindvault_import_wallet > output schema 1`] = `
   "required": [
     "profile",
     "address",
+    "network",
     "persisted",
   ],
   "type": "object",
@@ -2065,6 +2081,9 @@ exports[`tool schema snapshots > mindvault_list_profiles > output schema 1`] = `
     "profiles": {
       "items": {
         "properties": {
+    "network": {
+      "type": "string",
+    },
           "active": {
             "type": "boolean",
           },
@@ -4734,6 +4753,7 @@ exports[`tool schema snapshots > mindvault_setup_wallet > output schema 1`] = `
   "required": [
     "profile",
     "address",
+    "network",
     "persisted",
   ],
   "type": "object",
@@ -5370,6 +5390,9 @@ exports[`tool schema snapshots > mindvault_wallet_balances > output schema 1`] =
           "address": {
             "type": "string",
           },
+          "network": {
+            "type": "string",
+          },
           "note": {
             "type": [
               "string",
@@ -5422,6 +5445,7 @@ exports[`tool schema snapshots > mindvault_wallet_balances > output schema 1`] =
         "required": [
           "profile",
           "address",
+          "network",
           "active",
           "publisherRegistered",
           "xlmBalance",
@@ -5454,6 +5478,9 @@ exports[`tool schema snapshots > mindvault_wallet_balances > output schema 1`] =
         },
         "configured": {
           "type": "boolean",
+        },
+        "network": {
+          "type": "string",
         },
         "note": {
           "type": [
@@ -5508,6 +5535,7 @@ exports[`tool schema snapshots > mindvault_wallet_balances > output schema 1`] =
         "configured",
         "profile",
         "address",
+        "network",
         "active",
         "publisherRegistered",
         "xlmBalance",
@@ -5528,8 +5556,61 @@ exports[`tool schema snapshots > mindvault_wallet_balances > output schema 1`] =
     "source": {
       "type": "string",
     },
+    "spendSummary": {
+      "properties": {
+        "asset": {
+          "const": "USDC",
+          "type": "string",
+        },
+        "configuredAutoPayCeilingUsdc": {
+          "type": "string",
+        },
+        "currentBalanceUsdc": {
+          "type": [
+            "string",
+            "null",
+          ],
+        },
+        "estimateBasis": {
+          "type": "string",
+        },
+        "estimatedPendingSpendUsdc": {
+          "type": [
+            "string",
+            "null",
+          ],
+        },
+        "network": {
+          "type": "string",
+        },
+        "pendingPurchaseCount": {
+          "type": "integer",
+        },
+        "pricedPendingPurchaseCount": {
+          "type": "integer",
+        },
+        "profile": {
+          "type": "string",
+        },
+      },
+      "required": [
+        "profile",
+        "network",
+        "asset",
+        "currentBalanceUsdc",
+        "estimatedPendingSpendUsdc",
+        "pendingPurchaseCount",
+        "pricedPendingPurchaseCount",
+        "configuredAutoPayCeilingUsdc",
+        "estimateBasis",
+      ],
+      "type": "object",
+    },
     "statistics": {
       "properties": {
+        "network": {
+          "type": "string",
+        },
         "totalUsdc": {
           "type": "string",
         },
@@ -5538,6 +5619,7 @@ exports[`tool schema snapshots > mindvault_wallet_balances > output schema 1`] =
         },
       },
       "required": [
+        "network",
         "totalUsdc",
         "totalXlm",
       ],
@@ -5551,6 +5633,7 @@ exports[`tool schema snapshots > mindvault_wallet_balances > output schema 1`] =
     "agents",
     "count",
     "statistics",
+    "spendSummary",
     "message",
   ],
   "type": "object",
@@ -5623,6 +5706,128 @@ exports[`tool schema snapshots > mindvault_wallet_info > output schema 1`] = `
 }
 `;
 
+exports[`tool schema snapshots > mindvault_contract_preflight > annotations 1`] = `
+{
+  "destructiveHint": false,
+  "idempotentHint": true,
+  "readOnlyHint": true,
+  "title": "Contract Preflight",
+}
+`;
+
+exports[`tool schema snapshots > mindvault_contract_preflight > input schema 1`] = `
+{
+  "properties": {},
+  "required": [],
+  "type": "object",
+}
+`;
+
+exports[`tool schema snapshots > mindvault_contract_preflight > output schema 1`] = `
+{
+  "properties": {
+    "contractId": {
+      "type": "string",
+    },
+    "deployedNetworkId": {
+      "type": [
+        "string",
+        "null",
+      ],
+    },
+    "deployedSchemaVersion": {
+      "type": [
+        "integer",
+        "null",
+      ],
+    },
+    "expectedNetworkId": {
+      "type": "string",
+    },
+    "issues": {
+      "items": {
+        "properties": {
+          "action": {
+            "type": "string",
+          },
+          "actual": {
+            "type": "string",
+          },
+          "expected": {
+            "type": "string",
+          },
+          "field": {
+            "enum": [
+              "contractId",
+              "registry",
+              "networkId",
+              "schemaVersion",
+            ],
+            "type": "string",
+          },
+        },
+        "required": [
+          "field",
+          "expected",
+          "actual",
+          "action",
+        ],
+        "type": "object",
+      },
+      "type": "array",
+    },
+    "message": {
+      "type": "string",
+    },
+    "network": {
+      "type": "string",
+    },
+    "ready": {
+      "type": "boolean",
+    },
+    "registryName": {
+      "type": [
+        "string",
+        "null",
+      ],
+    },
+    "rpcUrl": {
+      "type": "string",
+    },
+    "status": {
+      "enum": [
+        "ready",
+        "blocked",
+        "error",
+        "skipped",
+      ],
+      "type": "string",
+    },
+    "supportedSchemaVersions": {
+      "items": {
+        "type": "integer",
+      },
+      "type": "array",
+    },
+  },
+  "required": [
+    "status",
+    "ready",
+    "message",
+    "contractId",
+    "network",
+    "rpcUrl",
+    "expectedNetworkId",
+    "deployedNetworkId",
+    "registryName",
+    "deployedSchemaVersion",
+    "supportedSchemaVersions",
+    "issues",
+  ],
+  "type": "object",
+}
+`;
+
 exports[`tool schema snapshots > the covered tool names are pinned 1`] = `
 [
   "mindvault_accept_transfer",
@@ -5636,6 +5841,7 @@ exports[`tool schema snapshots > the covered tool names are pinned 1`] = `
   "mindvault_check_consistency",
   "mindvault_check_state_permissions",
   "mindvault_compare_catalogs",
+  "mindvault_contract_preflight",
   "mindvault_debug_bundle",
   "mindvault_export_receipts",
   "mindvault_fee_config",

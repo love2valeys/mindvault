@@ -34,6 +34,7 @@ import { RECEIPT_EXPORT_MAX_LIMIT } from "./receipts.js";
 import { DEBUG_BUNDLE_MAX_AUDIT_LINES } from "./debugBundleSchema.js";
 import { TOOL_DEFINITIONS } from "./tools.js";
 import { MAX_SETTLEMENT_TIMEOUT_MS, MIN_SETTLEMENT_INTERVAL_MS } from "./settlement.js";
+import { StrKey } from "@stellar/stellar-sdk";
 
 // ── Spec model ────────────────────────────────────────────────────────────────
 
@@ -88,6 +89,8 @@ export interface ArgumentSpec {
   pattern?: RegExp;
   /** Human-readable description of `pattern`, used in the error message. */
   patternHint?: string;
+  /** Require a checksum-valid Stellar Ed25519 public key after shape validation. */
+  stellarAddress?: boolean;
   /**
    * Keep the canonical hex-only form of a digest instead of the
    * `"<algorithm>:<hex>"` spelling — `hash` only. Used where a downstream
@@ -169,6 +172,7 @@ const STELLAR_ADDRESS: ArgumentSpec = {
   maxLength: 56,
   pattern: /^G[A-Z2-7]{55}$/,
   patternHint: "a Stellar public key (G… , 56 chars)",
+  stellarAddress: true,
 };
 
 /** Metadata pointer (max 512 chars, supported prefix). */
@@ -349,6 +353,7 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
   },
   mindvault_agent_status: {},
   mindvault_registry_info: {},
+  mindvault_contract_preflight: {},
   mindvault_terms: {
     operation: { kind: "enum", required: true, values: ["get", "set"] },
     creator: STELLAR_ADDRESS,
@@ -487,6 +492,8 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
       patternHint: "a Stellar secret key (S… , 56 chars)",
     },
     profile: PROFILE_NAME,
+    network: { kind: "enum", values: ["testnet", "mainnet"] },
+    confirmAddress: STELLAR_ADDRESS,
     persist: { kind: "flag" },
     confirmMainnet: CONFIRM_MAINNET,
   },
@@ -826,7 +833,19 @@ function validateString(
     });
     return undefined;
   }
+  if (spec.stellarAddress && !isValidStellarPublicKey(trimmed)) {
+    issues.push({
+      field,
+      code: "pattern_mismatch",
+      message: `${field} is not a valid Stellar public address.`,
+    });
+    return undefined;
+  }
   return trimmed;
+}
+
+export function isValidStellarPublicKey(value: unknown): value is string {
+  return typeof value === "string" && StrKey.isValidEd25519PublicKey(value);
 }
 
 function validateEnum(

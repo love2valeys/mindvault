@@ -130,8 +130,11 @@ export function isStale(savedAtMs: number, nowMs: number = Date.now()): boolean 
 }
 
 /** Record a successful catalog read. The raw resource array is snapshotted. */
-export function recordCatalogSnapshot(resources: unknown[]): void {
-  catalogs.set(currentCatalogCacheScope(), { resources, savedAtMs: Date.now() });
+export function recordCatalogSnapshot(
+  resources: unknown[],
+  scope: string = currentCatalogCacheScope(),
+): void {
+  catalogs.set(scope, { resources, savedAtMs: Date.now() });
 }
 
 /**
@@ -141,8 +144,10 @@ export function recordCatalogSnapshot(resources: unknown[]): void {
  * An expired snapshot is dropped rather than merely hidden, so the memory is
  * released and a later call cannot resurrect it.
  */
-export function getCatalogSnapshot(nowMs: number = Date.now()): CatalogSnapshot | null {
-  const scope = currentCatalogCacheScope();
+export function getCatalogSnapshot(
+  nowMs: number = Date.now(),
+  scope: string = currentCatalogCacheScope(),
+): CatalogSnapshot | null {
   const catalog = catalogs.get(scope);
   if (!catalog) return null;
   if (isExpired(catalog.savedAtMs, nowMs)) {
@@ -153,8 +158,12 @@ export function getCatalogSnapshot(nowMs: number = Date.now()): CatalogSnapshot 
 }
 
 /** Record a successful preview read for a resource id. */
-export function recordPreviewSnapshot(resourceId: string, meta: unknown): void {
-  previews[`${currentCatalogCacheScope()}\u0000${resourceId}`] = { meta, savedAtMs: Date.now() };
+export function recordPreviewSnapshot(
+  resourceId: string,
+  meta: unknown,
+  scope: string = currentCatalogCacheScope(),
+): void {
+  previews[`${scope}\u0000${resourceId}`] = { meta, savedAtMs: Date.now() };
 }
 
 /**
@@ -164,8 +173,9 @@ export function recordPreviewSnapshot(resourceId: string, meta: unknown): void {
 export function getPreviewSnapshot(
   resourceId: string,
   nowMs: number = Date.now(),
+  scope: string = currentCatalogCacheScope(),
 ): PreviewSnapshot | null {
-  const key = `${currentCatalogCacheScope()}\u0000${resourceId}`;
+  const key = `${scope}\u0000${resourceId}`;
   const snap = previews[key];
   if (!snap) return null;
   if (isExpired(snap.savedAtMs, nowMs)) {

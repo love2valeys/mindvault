@@ -32,12 +32,18 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
   GetPromptRequestSchema,
+  ListResourcesRequestSchema,
   ListPromptsRequestSchema,
   ListToolsRequestSchema,
+  ReadResourceRequestSchema,
+  type Resource,
+  type TextResourceContents,
 } from "@modelcontextprotocol/sdk/types.js";
 
 import { attachCorrelationId, correlationSuffix, withNewCorrelationId } from "./correlation.js";
 import { scopeProgressToRequest } from "./progress.js";
+import { logger } from "./logger.js";
+import { outputValidationErrors, textFallback } from "./toolResult.js";
 
 /** Anything the MCP SDK will accept in `server.connect`. */
 export interface McpTransport {
@@ -92,6 +98,10 @@ export interface ServerBehaviour {
   listPrompts?: () => AdvertisedPrompt[];
   /** Resolve one prompt. Required when `listPrompts` is supplied. */
   getPrompt?: (name: string, args: Record<string, string | undefined>) => ResolvedPrompt;
+  /** Resources to advertise. Must be paired with `readResource`. */
+  listResources?: () => Resource[];
+  /** Resolve the contents of one resource URI. */
+  readResource?: (uri: string) => TextResourceContents | Promise<TextResourceContents>;
   /** Build the structured result for a tool, when it declares an output schema. */
   structuredResult?: (name: string, text: string) => Record<string, unknown> | undefined;
   /** Render a failure into agent-facing text. Defaults to the error message. */
@@ -133,15 +143,28 @@ export function createMindVaultServer(
   if (behaviour.listPrompts && !behaviour.getPrompt) {
     throw new Error("getPrompt is required when listPrompts is supplied");
   }
+  if (Boolean(behaviour.listResources) !== Boolean(behaviour.readResource)) {
+    throw new Error("listResources and readResource must be supplied together");
+  }
 
   const capabilities: Record<string, unknown> = { tools: {} };
   if (behaviour.listPrompts) capabilities.prompts = {};
+  if (behaviour.listResources) capabilities.resources = {};
 
   const server = new Server({ name: identity.name, version: identity.version }, { capabilities });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: behaviour.listTools(),
   }));
+
+  if (behaviour.listResources && behaviour.readResource) {
+    server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+      resources: behaviour.listResources!(),
+    }));
+    server.setRequestHandler(ReadResourceRequestSchema, async (request: any) => ({
+      contents: [await behaviour.readResource!(request.params.uri)],
+    }));
+  }
 
   server.setRequestHandler(CallToolRequestSchema, async (request: any, extra: any) => {
     const { name, arguments: args = {} } = request.params;
@@ -158,16 +181,36 @@ export function createMindVaultServer(
       try {
         const text = await behaviour.dispatchTool(name, args, progress?.emit);
         const structured = behaviour.structuredResult?.(name, text);
+        const outputSchema = behaviour.listTools().find((tool) => tool.name === name)?.outputSchema;
+        const resultContent = structured ?? (outputSchema ? textFallback(text) : undefined);
+        if (outputSchema && resultContent) {
+          const errors = outputValidationErrors(outputSchema as object, resultContent);
+          if (errors.length > 0) {
+            logger.warn("MCP output contract mismatch for %s (%s)", name, errors.join(", "));
+            return attachCorrelationId(
+              {
+                content: [
+                  { type: "text", text: "Internal tool output failed schema validation." },
+                ],
+                isError: true,
+              },
+              correlationId,
+            );
+          }
+        }
         return attachCorrelationId(
           {
             content: [{ type: "text", text }],
-            ...(structured ? { structuredContent: structured } : {}),
+            ...(resultContent ? { structuredContent: resultContent } : {}),
           },
           correlationId,
         );
       } catch (error) {
         const message = (behaviour.formatError ?? defaultFormatError)(error);
-        const extraContent = behaviour.errorContent?.(error);
+        const hasOutputSchema = behaviour
+          .listTools()
+          .some((tool) => tool.name === name && tool.outputSchema !== undefined);
+        const extraContent = hasOutputSchema ? undefined : behaviour.errorContent?.(error);
         // The ID goes into the error text as well as `_meta`: a failure is the
         // one case where a human is likely to quote it back.
         return attachCorrelationId(

@@ -53,6 +53,17 @@ export const WALLET_SETUP_OUTPUT_SCHEMA = {
   required: ["profile", "address", "persisted"],
 } as const;
 
+export const WALLET_IMPORT_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    profile: { type: "string" },
+    address: { type: "string" },
+    network: { type: "string" },
+    persisted: { type: "boolean" },
+  },
+  required: ["profile", "address", "network", "persisted"],
+} as const;
+
 export const WALLET_INFO_OUTPUT_SCHEMA = {
   type: "object",
   properties: {
@@ -94,6 +105,7 @@ const BALANCE_ROW_SCHEMA = {
   properties: {
     profile: { type: ["string", "null"] },
     address: { type: "string" },
+    network: { type: "string" },
     active: { type: ["boolean", "null"] },
     publisherRegistered: { type: ["boolean", "null"] },
     xlmBalance: { type: ["string", "null"] },
@@ -106,6 +118,7 @@ const BALANCE_ROW_SCHEMA = {
   required: [
     "profile",
     "address",
+    "network",
     "active",
     "publisherRegistered",
     "xlmBalance",
@@ -134,12 +147,50 @@ export const WALLET_BALANCES_OUTPUT_SCHEMA = {
     count: { type: "integer" },
     statistics: {
       type: "object",
-      properties: { totalUsdc: { type: "string" }, totalXlm: { type: "string" } },
-      required: ["totalUsdc", "totalXlm"],
+      properties: {
+        network: { type: "string" },
+        totalUsdc: { type: "string" },
+        totalXlm: { type: "string" },
+      },
+      required: ["network", "totalUsdc", "totalXlm"],
+    },
+    spendSummary: {
+      type: "object",
+      properties: {
+        profile: { type: "string" },
+        network: { type: "string" },
+        asset: { type: "string", const: "USDC" },
+        currentBalanceUsdc: { type: ["string", "null"] },
+        estimatedPendingSpendUsdc: { type: ["string", "null"] },
+        pendingPurchaseCount: { type: "integer" },
+        pricedPendingPurchaseCount: { type: "integer" },
+        configuredAutoPayCeilingUsdc: { type: "string" },
+        estimateBasis: { type: "string" },
+      },
+      required: [
+        "profile",
+        "network",
+        "asset",
+        "currentBalanceUsdc",
+        "estimatedPendingSpendUsdc",
+        "pendingPurchaseCount",
+        "pricedPendingPurchaseCount",
+        "configuredAutoPayCeilingUsdc",
+        "estimateBasis",
+      ],
     },
     message: { type: "string" },
   },
-  required: ["source", "requestedAt", "platform", "agents", "count", "statistics", "message"],
+  required: [
+    "source",
+    "requestedAt",
+    "platform",
+    "agents",
+    "count",
+    "statistics",
+    "spendSummary",
+    "message",
+  ],
 } as const;
 
 export const SERVER_ENDPOINTS_OUTPUT_SCHEMA = {
@@ -496,6 +547,50 @@ export const REGISTRY_INFO_OUTPUT_SCHEMA = {
     "x402Network",
     "resourceFields",
     "mainnetDiagnostics",
+  ],
+} as const;
+
+export const CONTRACT_PREFLIGHT_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    status: { type: "string", enum: ["ready", "blocked", "error", "skipped"] },
+    ready: { type: "boolean" },
+    message: { type: "string" },
+    contractId: { type: "string" },
+    network: { type: "string" },
+    rpcUrl: { type: "string" },
+    expectedNetworkId: { type: "string" },
+    deployedNetworkId: { type: ["string", "null"] },
+    registryName: { type: ["string", "null"] },
+    deployedSchemaVersion: { type: ["integer", "null"] },
+    supportedSchemaVersions: { type: "array", items: { type: "integer" } },
+    issues: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          field: { type: "string", enum: ["contractId", "registry", "networkId", "schemaVersion"] },
+          expected: { type: "string" },
+          actual: { type: "string" },
+          action: { type: "string" },
+        },
+        required: ["field", "expected", "actual", "action"],
+      },
+    },
+  },
+  required: [
+    "status",
+    "ready",
+    "message",
+    "contractId",
+    "network",
+    "rpcUrl",
+    "expectedNetworkId",
+    "deployedNetworkId",
+    "registryName",
+    "deployedSchemaVersion",
+    "supportedSchemaVersions",
+    "issues",
   ],
 } as const;
 

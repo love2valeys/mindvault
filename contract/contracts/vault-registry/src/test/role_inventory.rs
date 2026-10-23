@@ -53,6 +53,61 @@ fn role_inventory_tracks_grants_and_revocations_per_role() {
 }
 
 #[test]
+fn role_index_and_fee_mutations_bump_instance_ttl_near_threshold() {
+    let (env, _creator, _admin, client) = setup_with_admin();
+    let contract = client.address.clone();
+    let verifier = Address::generate(&env);
+
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + TTL_DAY_IN_LEDGERS + 1);
+    env.as_contract(&contract, || {
+        role_inventory::track_grant(&env, RoleKind::Verifier, &verifier)
+    })
+    .unwrap();
+    assert_eq!(
+        env.as_contract(&contract, || env.storage().instance().get_ttl()),
+        TTL_BUMP_AMOUNT
+    );
+    assert_eq!(
+        client.list_role_members(&RoleKind::Verifier, &0, &10).members,
+        Vec::from_array(&env, [verifier.clone()])
+    );
+
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + TTL_DAY_IN_LEDGERS + 1);
+    env.as_contract(&contract, || {
+        role_inventory::track_revoke(&env, RoleKind::Verifier, &verifier)
+    });
+    assert_eq!(
+        env.as_contract(&contract, || env.storage().instance().get_ttl()),
+        TTL_BUMP_AMOUNT
+    );
+
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + TTL_DAY_IN_LEDGERS + 1);
+    client.set_fee_config(&FeeConfig {
+        platform_fee_bps: 0,
+        royalty_bps: 0,
+        fee_recipient: None,
+    });
+    assert_eq!(
+        env.as_contract(&contract, || env.storage().instance().get_ttl()),
+        TTL_BUMP_AMOUNT
+    );
+
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + TTL_DAY_IN_LEDGERS + 1);
+    client.set_fee_destination(&FeeDestinationConfig {
+        bps: 0,
+        destination: FeeDestination::None,
+    });
+    assert_eq!(
+        env.as_contract(&contract, || env.storage().instance().get_ttl()),
+        TTL_BUMP_AMOUNT
+    );
+}
+
+#[test]
 fn role_inventory_pages_are_ordered_and_capped() {
     let (env, _creator, client) = setup();
     client.nominate_new_admin(&Address::generate(&env));

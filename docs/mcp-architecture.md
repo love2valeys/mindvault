@@ -4,6 +4,12 @@ This document describes how an AI agent (Claude Code, Codex, or any MCP-enabled 
 
 The MCP server is a thin adapter layer. It translates natural-language tool calls into HTTP API requests and x402 payment flows, then returns a human-readable text block and, for tools with structured results, a machine-readable `structuredContent` object (see [mcp-structured-output.md](mcp-structured-output.md)). The agent never touches Stellar or Soroban directly — the MCP server handles wallet management, payment signing, and x402 negotiation.
 
+The read-only `mindvault://server/metadata` resource reports the active Stellar
+network, registry contract ID, tool capability version, and process status. Its
+contents are resolved on each read, so network profile changes are reflected;
+wallet addresses and credentials are never included. Increment
+`MCP_TOOL_CAPABILITY_VERSION` when the advertised tool contract changes.
+
 ---
 
 ## Flow Diagram

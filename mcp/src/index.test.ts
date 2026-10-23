@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 
 const getAttestationHashMock = vi.hoisted(() => vi.fn());
 
@@ -86,6 +89,8 @@ import {
   _clearCatalogCache,
 } from "./catalogCache.js";
 import { Keypair } from "@stellar/stellar-sdk";
+import { _setPurchasesFilePath } from "./purchaseHistory.js";
+import { trackPurchaseAttempt } from "./purchaseStatusLookup.js";
 
 function mockResponse(data: unknown, ok = true, status = 200): Response {
   const body = JSON.stringify(data);
@@ -1085,6 +1090,66 @@ describe("buy – happy path (402 → sign → retry → success)", () => {
   });
 });
 
+describe("wallet balances spend summary", () => {
+  it("labels the active-network USDC balance, pending estimate, and configured ceiling", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mindvault-wallet-summary-"));
+    _setPurchasesFilePath(join(dir, "purchases.json"));
+    _resetProfiles();
+    try {
+      const result = await dispatchTool("mindvault_wallet_balances", {});
+      expect(result).toContain("Spend summary (default,");
+      expect(result).toContain("USDC): balance unavailable; estimated pending spend 0;");
+      expect(result).toContain("automatic payment ceiling 10.");
+    } finally {
+      _resetProfiles();
+      _setPurchasesFilePath(null);
+      rmSync(dir, { recursive: true, force: true });
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("estimates pending spend from current listing prices", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mindvault-wallet-pending-"));
+    _setPurchasesFilePath(join(dir, "purchases.json"));
+    _resetProfiles();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse({ price: "3.25" }));
+    try {
+      await expect(
+        trackPurchaseAttempt("default", "pending-key", "res-pending", false, async () => {
+          throw Object.assign(new Error("Request timed out"), { name: "TimeoutError" });
+        }),
+      ).rejects.toThrow();
+
+      const result = await dispatchTool("mindvault_wallet_balances", {});
+      expect(result).toContain("estimated pending spend 3.25");
+      expect(result).toContain("1/1 purchase attempts priced");
+    } finally {
+      _resetProfiles();
+      _setPurchasesFilePath(null);
+      rmSync(dir, { recursive: true, force: true });
+      vi.restoreAllMocks();
+    }
+  });
+});
+
+describe("Stellar argument validation", () => {
+  it("rejects an invalid address checksum before any API request", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch");
+    try {
+      await expect(
+        dispatchTool("mindvault_register", {
+          name: "Agent",
+          email: "agent@example.com",
+          walletAddress: `G${"A".repeat(55)}`,
+        }),
+      ).rejects.toThrow("walletAddress is not a valid Stellar public address");
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+});
+
 describe("buy – output shape for agent consumption", () => {
   beforeEach(() => {
     _setAgentWallet(testWallet);
@@ -1463,9 +1528,11 @@ describe("registerOnchain – happy path", () => {
   beforeEach(() => {
     _setAgentWallet(testWallet);
     _setAgentApiKey("test-api-key");
+    _setMockMode(true);
   });
 
   afterEach(() => {
+    _setMockMode(false);
     _setAgentWallet(null);
     _setAgentApiKey(null);
     vi.restoreAllMocks();
@@ -1528,9 +1595,11 @@ describe("registerOnchain – error and retry messaging", () => {
   beforeEach(() => {
     _setAgentWallet(testWallet);
     _setAgentApiKey("test-api-key");
+    _setMockMode(true);
   });
 
   afterEach(() => {
+    _setMockMode(false);
     _setAgentWallet(null);
     _setAgentApiKey(null);
     vi.restoreAllMocks();
@@ -3029,6 +3098,30 @@ describe("offline catalog cache fallback (#556)", () => {
     expect(out).toContain("cached");
   });
 
+  it("coalesces concurrent reads for the same catalog URL", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse([catalogItem]));
+
+    const [first, second] = await Promise.all([browse(), browse()]);
+
+    expect(first).toContain("[c1] Cached One");
+    expect(second).toContain("[c1] Cached One");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces a failed read but does not retain it for later calls", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(mockResponse({ error: "bad request" }, false, 400));
+
+    const results = await Promise.allSettled([browse(), browse()]);
+
+    expect(results.every((result) => result.status === "rejected")).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    await expect(browse()).rejects.toThrow(/bad request/);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
   it("search applies filters to the cached snapshot and labels it when offline", async () => {
     recordCatalogSnapshot([catalogItem]);
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ECONNREFUSED"));
@@ -3056,6 +3149,25 @@ describe("offline catalog cache fallback (#556)", () => {
     const parsed = JSON.parse(await preview("res-9"));
     expect(parsed.title).toBe("Cached Preview");
     expect(parsed.offlineCache).toContain("Offline catalog snapshot served");
+  });
+
+  it("coalesces concurrent preview misses for the same resource", async () => {
+    const previewMeta = {
+      id: "res-shared",
+      title: "Shared Preview",
+      price: "4",
+      description: "D",
+      resourceType: "article",
+      verificationStatus: "verified",
+      accessUrl: "https://example.com/shared",
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse(previewMeta));
+
+    const [first, second] = await Promise.all([preview("res-shared"), preview("res-shared")]);
+
+    expect(JSON.parse(first).title).toBe("Shared Preview");
+    expect(JSON.parse(second).title).toBe("Shared Preview");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
   it("serves the snapshot for a gateway error the retry layer could not ride out", async () => {

@@ -5,7 +5,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { validateToolArgs } from "./validation.js";
 import { _setPurchasesFilePath } from "./purchaseHistory.js";
-import { lookupPurchaseStatus, trackPurchaseAttempt } from "./purchaseStatusLookup.js";
+import {
+  listPendingPurchaseAttempts,
+  lookupPurchaseStatus,
+  trackPurchaseAttempt,
+} from "./purchaseStatusLookup.js";
 
 let dir: string;
 
@@ -48,6 +52,22 @@ describe("lookupPurchaseStatus", () => {
     expect(out.state).toBe("unknown");
     expect(out.resourceId).toBeNull();
     expect(out.txHash).toBeNull();
+  });
+});
+
+describe("listPendingPurchaseAttempts", () => {
+  it("returns only pending attempts for the requested profile", async () => {
+    await expect(
+      trackPurchaseAttempt("alice", "pending-key", "res-pending", false, async () => {
+        throw Object.assign(new Error("Request timed out"), { name: "TimeoutError" });
+      }),
+    ).rejects.toThrow();
+    await trackPurchaseAttempt("bob", "settled-key", "res-settled", false, async () => settledResult);
+
+    expect(listPendingPurchaseAttempts("alice").map((attempt) => attempt.resourceId)).toEqual([
+      "res-pending",
+    ]);
+    expect(listPendingPurchaseAttempts("bob")).toEqual([]);
   });
 });
 

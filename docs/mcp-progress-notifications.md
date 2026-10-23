@@ -29,14 +29,18 @@ The server then emits notifications carrying that token:
     "progressToken": "publish-1",
     "progress": 2,
     "total": 31,
-    "message": "Verification pending — poll 2, still waiting."
+    "message": "Verification pending — poll 2, still waiting.",
+    "_meta": { "mindvault/progressSequence": 2 }
   }
 }
 ```
 
 Without a `progressToken` the tool behaves exactly as before — no notifications
 are sent, and the final result is unchanged. `progress` increases with every
-notification, as the MCP spec requires.
+notification, as the MCP spec requires. The namespaced `_meta` sequence starts
+at 1 for each tool call and increases once per notification. Clients can combine
+it with `progressToken` to discard duplicate notifications replayed after a
+transport reconnect; the standard progress fields remain unchanged.
 
 ## Delivery order
 

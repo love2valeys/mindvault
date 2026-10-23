@@ -187,6 +187,7 @@ describe("stateMutex", () => {
       expect(serializesStateTool("mindvault_publish_status")).toBe(false);
       expect(serializesStateTool("mindvault_agent_status")).toBe(false);
       expect(serializesStateTool("mindvault_registry_info")).toBe(false);
+      expect(serializesStateTool("mindvault_contract_preflight")).toBe(false);
       expect(serializesStateTool("mindvault_network_profile")).toBe(false);
       expect(serializesStateTool("mindvault_check_bindings")).toBe(false);
       expect(serializesStateTool("mindvault_check_consistency")).toBe(false);

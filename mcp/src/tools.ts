@@ -28,6 +28,7 @@ import {
   ATTESTATION_VERIFICATION_OUTPUT_SCHEMA,
   BATCH_CATALOG_LOOKUP_OUTPUT_SCHEMA,
   CATALOG_LIST_OUTPUT_SCHEMA,
+  CONTRACT_PREFLIGHT_OUTPUT_SCHEMA,
   CONSISTENCY_OUTPUT_SCHEMA,
   FEE_CONFIG_OUTPUT_SCHEMA,
   LIST_PROFILES_OUTPUT_SCHEMA,
@@ -56,6 +57,7 @@ import {
   USE_PROFILE_OUTPUT_SCHEMA,
   WALLET_BALANCES_OUTPUT_SCHEMA,
   WALLET_INFO_OUTPUT_SCHEMA,
+  WALLET_IMPORT_OUTPUT_SCHEMA,
   WALLET_SETUP_OUTPUT_SCHEMA,
 } from "./outputSchemas.js";
 import { PURCHASE_STATUS_OUTPUT_SCHEMA } from "./purchaseStatusLookup.js";
@@ -96,7 +98,7 @@ export interface ToolAnnotations {
   title: string;
   /** The tool performs no state changes or side effects. */
   readOnlyHint: boolean;
-  /** The tool can irreversibly destroy local state. */
+  /** The tool may perform destructive updates. */
   destructiveHint: boolean;
   /** Repeating the tool with identical arguments is safe and yields the same result. */
   idempotentHint: boolean;
@@ -266,7 +268,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     outputSchema: CATALOG_LIST_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
     annotations: {
       title: "Browse Catalog",
-      readOnlyHint: true,
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
     },
@@ -283,7 +285,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     outputSchema: CATALOG_LIST_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
     annotations: {
       title: "Search Catalog",
-      readOnlyHint: true,
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
     },
@@ -705,6 +707,19 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: "mindvault_contract_preflight",
+    description:
+      "Read the configured registry's on-chain identity, network ID, and Resource schema version. Reports whether the contract ID, configured Stellar network, and schema are compatible, with specific fixes for mismatches. Run this before publish or on-chain registration; it never writes to the contract.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    outputSchema: CONTRACT_PREFLIGHT_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+    annotations: {
+      title: "Contract Preflight",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
+  {
     name: "mindvault_terms",
     description:
       'Get or set the active publisher wallet\'s on-chain licensing terms hash. Use operation "get" with a creator address to inspect terms, or "set" with termsHash to bind the active creator identity to a terms document digest.',
@@ -995,9 +1010,9 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
     annotations: {
       title: "Back Up State",
-      readOnlyHint: true,
+      readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: true,
+      idempotentHint: false,
     },
   },
   {
@@ -1090,7 +1105,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       title: "Tool Metrics",
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: true,
+      idempotentHint: false,
     },
   },
   {
@@ -1471,7 +1486,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     inputSchema: { type: "object", properties: {}, required: [] },
     annotations: {
       title: "Pre-warm Catalog Cache",
-      readOnlyHint: true,
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
     },
@@ -1515,7 +1530,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "mindvault_import_wallet",
     description:
-      "Import an existing Stellar wallet by providing a secret key (or reading MINDVAULT_AGENT_SECRET from the environment). Validates the key, optionally persists it to the active profile (or a named profile), and never logs the secret. Use this to restore a wallet from backup or connect to an existing identity.",
+      "Verify an imported Stellar wallet first, then persist it only after confirming its derived public address, profile, and configured network. The secret is never returned or included in errors.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1527,13 +1542,22 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         },
         profile: {
           type: "string",
-          description: "Optional profile name to import into. Defaults to the active profile.",
+          description: "Profile name to import into. Required when persist is true.",
           examples: ["testnet", "mainnet-publisher"],
+        },
+        network: {
+          type: "string",
+          enum: ["testnet", "mainnet"],
+          description: "Stellar network to bind to the profile. Must match the configured network to persist.",
+        },
+        confirmAddress: {
+          type: "string",
+          description: "Exact public address returned by the verification call; required to persist.",
         },
         persist: {
           type: "boolean",
           description:
-            "When true (default), save the imported wallet to the state file. When false, validate only and return the public key without writing to disk.",
+            "When true, save only after profile, network, and confirmAddress are explicitly supplied. Defaults to false for a verification-only preview.",
           examples: [true, false],
         },
         confirmMainnet: {
@@ -1544,7 +1568,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       },
       required: [],
     },
-    outputSchema: WALLET_SETUP_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+    outputSchema: WALLET_IMPORT_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
     annotations: {
       title: "Import Wallet",
       readOnlyHint: false,

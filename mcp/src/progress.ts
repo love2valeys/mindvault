@@ -28,10 +28,13 @@ export function createProgressEmitter(
     return async () => {};
   }
   const { token, send } = ctx;
+  let sequence = 0;
   return async (progress: number, total?: number, message?: string) => {
+    sequence += 1;
     const params: Record<string, unknown> = {
       progressToken: token,
       progress,
+      _meta: { "mindvault/progressSequence": sequence },
     };
     if (total != null) params.total = total;
     if (message != null) params.message = message;

@@ -76,6 +76,7 @@ describe("isMainnetGatedTool", () => {
       "mindvault_wallet_info",
       "mindvault_list_profiles",
       "mindvault_registry_info",
+      "mindvault_contract_preflight",
       "mindvault_registry_lookup",
       "mindvault_tx_status",
       "mindvault_publish_status",

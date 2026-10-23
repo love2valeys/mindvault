@@ -249,7 +249,11 @@ The on-chain half of Option C now exists in `vault-registry` (see
 or `record_lease` (settler, `Active`), promoted by `settle_lease`, renewed by
 the holder with `renew_lease` (extending `expiry_ledger` with zero access gap), revoked by
 the creator with `revoke_lease`, and read with `get_lease`, `lease_is_active`
-and `lease_price`. Tier durations and price multipliers are platform defaults
+and `lease_price`. Renewal validates that the stored lease still matches its
+`(resource_id, holder)` key, so transfers cannot change its holder binding.
+`list_holder_leases_page` enumerates a holder's active, unexpired leases in
+resource registration order using a bounded global catalog cursor. Tier
+durations and price multipliers are platform defaults
 (`LEASE_*_LEDGERS`, `LEASE_*_MULTIPLIER`); creator-configurable tiers remain a
 follow-up. The MCP server buys and inspects leases with `mindvault_buy_lease`
 and `mindvault_lease_status`: the agent pays the creator in USDC directly, then

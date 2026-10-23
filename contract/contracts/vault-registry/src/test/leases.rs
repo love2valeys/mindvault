@@ -517,6 +517,109 @@ fn renew_lease_validates_pricing_state_and_auth() {
 }
 
 #[test]
+fn renew_lease_keeps_holder_binding_after_resource_transfer() {
+    let (env, creator, settler, holder, client) = lease_setup();
+    let id = register_priced(&env, &creator, &client, "leasexfer", 100i128);
+    let price = client.lease_price(&id, &LeaseTier::Hour);
+    client.record_lease(
+        &settler,
+        &holder,
+        &id,
+        &LeaseTier::Hour,
+        &price,
+        &String::from_str(&env, "tx_before_transfer"),
+    );
+
+    let new_creator = Address::generate(&env);
+    client.transfer_ownership(&id, &new_creator);
+    let renewed = client.renew_lease(
+        &holder,
+        &id,
+        &LeaseTier::Hour,
+        &price,
+        &String::from_str(&env, "tx_after_transfer"),
+    );
+    assert_eq!(renewed.resource_id, id);
+    assert_eq!(renewed.holder, holder);
+
+    let other_holder = Address::generate(&env);
+    assert_eq!(
+        client.try_renew_lease(
+            &other_holder,
+            &id,
+            &LeaseTier::Hour,
+            &price,
+            &String::from_str(&env, "tx_wrong_holder"),
+        ),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn list_holder_leases_pages_active_leases_and_filters_expired_and_other_holders() {
+    let (env, creator, settler, holder, client) = lease_setup();
+    let first_id = register_priced(&env, &creator, &client, "leasepage1", 100i128);
+    let other_id = register_priced(&env, &creator, &client, "leasepage2", 100i128);
+    let active_id = register_priced(&env, &creator, &client, "leasepage3", 100i128);
+    let expired_id = register_priced(&env, &creator, &client, "leasepage4", 100i128);
+    let other_holder = Address::generate(&env);
+    env.ledger().set_sequence_number(1_000);
+
+    let week_price = client.lease_price(&first_id, &LeaseTier::Week);
+    client.record_lease(
+        &settler,
+        &holder,
+        &first_id,
+        &LeaseTier::Week,
+        &week_price,
+        &String::from_str(&env, "tx_page_first"),
+    );
+    let other_week_price = client.lease_price(&other_id, &LeaseTier::Week);
+    client.record_lease(
+        &settler,
+        &other_holder,
+        &other_id,
+        &LeaseTier::Week,
+        &other_week_price,
+        &String::from_str(&env, "tx_page_other"),
+    );
+    let active_week_price = client.lease_price(&active_id, &LeaseTier::Week);
+    client.record_lease(
+        &settler,
+        &holder,
+        &active_id,
+        &LeaseTier::Week,
+        &active_week_price,
+        &String::from_str(&env, "tx_page_active"),
+    );
+    let hour_price = client.lease_price(&expired_id, &LeaseTier::Hour);
+    client.record_lease(
+        &settler,
+        &holder,
+        &expired_id,
+        &LeaseTier::Hour,
+        &hour_price,
+        &String::from_str(&env, "tx_page_expired"),
+    );
+    env.ledger()
+        .set_sequence_number(1_000 + LEASE_HOUR_LEDGERS);
+
+    let first_page = client.list_holder_leases_page(&holder, &0, &1);
+    assert_eq!(first_page.leases.len(), 1);
+    assert_eq!(first_page.leases.get(0).unwrap().resource_id, first_id);
+    assert_eq!(first_page.next_cursor, Some(1));
+
+    let second_page = client.list_holder_leases_page(&holder, &1, &2);
+    assert_eq!(second_page.leases.len(), 1);
+    assert_eq!(second_page.leases.get(0).unwrap().resource_id, active_id);
+    assert_eq!(second_page.next_cursor, Some(3));
+
+    let third_page = client.list_holder_leases_page(&holder, &3, &1);
+    assert!(third_page.leases.is_empty());
+    assert_eq!(third_page.next_cursor, None);
+}
+
+#[test]
 fn revoked_leases_remain_inactive_after_every_resource_state_transition() {
     let (env, creator, settler, holder, client) = lease_setup();
     let admin = client.admin().unwrap();
