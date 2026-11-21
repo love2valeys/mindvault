@@ -3,7 +3,9 @@ import { describe, it, expect } from "vitest";
 import { mapTransportError } from "./errorMapping.js";
 import {
   diagnoseSponsoredOutage,
+  diagnoseSponsoredWallet,
   formatSponsoredOutage,
+  formatSponsoredWalletDiagnostic,
   mapSponsoredHttpFailure,
   mapSponsoredTransportFailure,
   parseRetryAfter,
@@ -295,5 +297,110 @@ describe("mapSponsoredTransportFailure", () => {
     });
     expect(mapped.category).toBe("timeout");
     expect(mapped.summary).toContain("Issue: timeout");
+  });
+});
+
+describe("diagnoseSponsoredWallet – half-completed sponsored creation (#218)", () => {
+  const PUBLIC_A = `G${"A".repeat(55)}`;
+  const PUBLIC_B = `G${"B".repeat(55)}`;
+  const SECRET_A = `S${"A".repeat(55)}`;
+  const SECRET_B = `S${"B".repeat(55)}`;
+
+  const derive = (secret: string): string => {
+    if (secret === SECRET_A) return PUBLIC_A;
+    if (secret === SECRET_B) return PUBLIC_B;
+    throw new Error("invalid seed");
+  };
+
+  it("flags a funded address with no persisted local wallet as stale and unowned", () => {
+    const diag = diagnoseSponsoredWallet({
+      reportedAddress: PUBLIC_A,
+      localWallet: null,
+      derivePublicKey: derive,
+    });
+
+    expect(diag.status).toBe("stale_unowned");
+    expect(diag.owned).toBe(false);
+    expect(diag.stale).toBe(true);
+    expect(diag.reportedAddress).toBe(PUBLIC_A);
+    expect(diag.localOwnedAddress).toBeNull();
+    expect(diag.summary).toContain("not owned by the local keystore");
+
+    const rendered = formatSponsoredWalletDiagnostic(diag);
+    expect(rendered).toContain("Wallet status: stale_unowned");
+    expect(rendered).toContain("Owned: no");
+    expect(rendered).toContain("Stale: yes");
+    expect(rendered).toContain(PUBLIC_A);
+  });
+
+  it("flags a stored profile whose secret belongs to a different account without leaking the secret", () => {
+    const diag = diagnoseSponsoredWallet({
+      localWallet: { publicKey: PUBLIC_A, secretKey: SECRET_B },
+      derivePublicKey: derive,
+    });
+
+    expect(diag.status).toBe("stale_unowned");
+    expect(diag.owned).toBe(false);
+    expect(diag.stale).toBe(true);
+    expect(diag.integrityCode).toBe("address_mismatch");
+    expect(diag.reportedAddress).toBe(PUBLIC_A);
+    expect(diag.localOwnedAddress).toBe(PUBLIC_B);
+
+    const rendered = formatSponsoredWalletDiagnostic(diag);
+    expect(rendered).not.toContain(SECRET_B);
+    expect(rendered).toContain("NOT spendable");
+  });
+
+  it("flags a reported funded address that diverges from the locally persisted wallet", () => {
+    const diag = diagnoseSponsoredWallet({
+      reportedAddress: PUBLIC_A,
+      localWallet: { publicKey: PUBLIC_B, secretKey: SECRET_B },
+      derivePublicKey: derive,
+    });
+
+    expect(diag.status).toBe("stale_unowned");
+    expect(diag.owned).toBe(false);
+    expect(diag.stale).toBe(true);
+    expect(diag.reportedAddress).toBe(PUBLIC_A);
+    expect(diag.localOwnedAddress).toBe(PUBLIC_B);
+  });
+
+  it("reports owned when the local keystore derives the sponsored address", () => {
+    const diag = diagnoseSponsoredWallet({
+      reportedAddress: PUBLIC_A,
+      localWallet: { publicKey: PUBLIC_A, secretKey: SECRET_A },
+      derivePublicKey: derive,
+    });
+
+    expect(diag.status).toBe("owned");
+    expect(diag.owned).toBe(true);
+    expect(diag.stale).toBe(false);
+    expect(diag.localOwnedAddress).toBe(PUBLIC_A);
+    expect(diag.guidance).toEqual([]);
+  });
+
+  it("reports missing when neither a reported address nor a local wallet exists", () => {
+    const diag = diagnoseSponsoredWallet({
+      reportedAddress: null,
+      localWallet: null,
+      derivePublicKey: derive,
+    });
+
+    expect(diag.status).toBe("missing");
+    expect(diag.owned).toBe(false);
+    expect(diag.stale).toBe(false);
+  });
+
+  it("warns in mapSponsoredHttpFailure when a 504 error body references an unpersisted funded address", () => {
+    const mapped = mapSponsoredHttpFailure({
+      operation: OPERATION,
+      serviceUrl: SERVICE,
+      status: 504,
+      data: { error: "timeout after funding", publicKey: PUBLIC_A },
+    });
+
+    expect(mapped.action).toContain(PUBLIC_A);
+    expect(mapped.action).toContain("NOT persisted");
+    expect(mapped.action).toContain("NOT owned by the local keystore");
   });
 });

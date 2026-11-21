@@ -22,6 +22,7 @@ process.env.USERPROFILE = resetHome;
 const STATE_FILE = join(resetHome, ".mindvault", "state.json");
 
 const {
+  dispatchTool,
   resetState,
   backupState,
   listProfiles,
@@ -134,6 +135,19 @@ describe("mindvault_reset — confirmed", () => {
   it("does not clear on a false-ish confirmation", () => {
     expect(resetState(false, "no")).toContain("Reset NOT performed");
     expect(resetState(false, 0)).toContain("Reset NOT performed");
+    expect(listProfiles()).toContain(testWallet.publicKey);
+  });
+
+  it("rejects widened flag strings like 'on' at dispatch validation and preserves state (#221)", async () => {
+    await expect(dispatchTool("mindvault_reset", { all: true, confirm: "on" })).rejects.toThrow(
+      /allowed strings: true, 1, yes, false, 0, no/,
+    );
+    expect(existsSync(STATE_FILE)).toBe(true);
+    expect(listProfiles()).toContain(testWallet.publicKey);
+
+    const preview = await dispatchTool("mindvault_reset", { all: true, confirm: "no" });
+    expect(preview).toContain("Reset NOT performed");
+    expect(existsSync(STATE_FILE)).toBe(true);
     expect(listProfiles()).toContain(testWallet.publicKey);
   });
 });

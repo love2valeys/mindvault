@@ -275,6 +275,12 @@ describe("ListTools ↔ the dispatcher", () => {
       expect(byName.has(name), `${name} has no handler and must not be advertised`).toBe(false);
     }
   });
+
+  it("advertises and dispatches mindvault_set_tags (#225)", async () => {
+    expect(TOOLS_WITHOUT_HANDLERS).not.toContain("mindvault_set_tags");
+    expect(byName.has("mindvault_set_tags")).toBe(true);
+    expect(await isReachable("mindvault_set_tags")).toBe(true);
+  });
 });
 
 describe("ListTools ↔ the argument validator", () => {

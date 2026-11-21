@@ -1,0 +1,29 @@
+{
+  "description": "Fixture for tag-index integrity report: compares supplied resource tags with tag-index membership for a bounded ID set.",
+  "input": {
+    "ids": ["res-1", "res-2", "res-3", "res-4"],
+    "limit": 4,
+    "resources": {
+      "res-1": ["alpha", "beta"],
+      "res-2": ["beta"],
+      "res-3": [],
+      "res-4": ["gamma"]
+    },
+    "tagIndex": {
+      "alpha": ["res-1"],
+      "beta": ["res-1", "res-2", "res-3"],
+      "delta": ["res-2"]
+    }
+  },
+  "expected": {
+    "missing": [
+      { "id": "res-4", "tag": "gamma" }
+    ],
+    "stale": [
+      { "id": "res-2", "tag": "delta" },
+      { "id": "res-3", "tag": "beta" }
+    ],
+    "checkedIds": ["res-1", "res-2", "res-3", "res-4"],
+    "truncated": false
+  }
+}

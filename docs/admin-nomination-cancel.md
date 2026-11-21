@@ -7,3 +7,7 @@
 - Effect: clears the pending nominee, its expiry and its nominated-at ledger. A cancelled nominee calling `accept_admin` gets `AdminNominationExpired`, and the admin can nominate again straight away.
 - Event: `nomcancel` with the cancelled nominee address as data, so indexers can drop the pending entry.
 - Cancellation takes effect in the ledger it is called in; it is not gated by `ADMIN_NOMINATION_MIN_GAP`, so it can be used at any point before acceptance.
+
+## Monitoring Pending Admin Expiry
+
+Off-chain monitors can poll `pending_admin_expiry()` alongside `pending_admin()` to inspect the active nomination deadline ledger sequence (`Option<u32>`) and alert before a nomination expires.

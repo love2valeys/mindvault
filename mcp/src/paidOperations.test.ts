@@ -381,6 +381,9 @@ describe("the paid-operation policy through the MCP server", () => {
 
     process.env[PAID_CONFIRMATION_ENV_VAR] = "all";
     expect(await dispatchFailure("mindvault_set_price", args)).toMatch(/Paid-operation guardrail/);
+    expect(
+      await dispatchFailure("mindvault_set_tags", { resourceId: "mock-1", tags: ["dataset"] }),
+    ).toMatch(/Paid-operation guardrail/);
   });
 
   it("does not gate read-only tools under any policy", async () => {

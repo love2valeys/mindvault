@@ -95,18 +95,51 @@ export function isUsdcDecimal(value: unknown): value is string {
  */
 export type UsdcBalanceReading =
   | { source: "horizon"; balance: string }
-  | { source: "soroban"; stroops: bigint };
+  | { source: "soroban"; stroops: bigint; decimals?: number };
+
+const MAX_SUPPORTED_TOKEN_DECIMALS = 18;
+
+/**
+ * Convert any tagged balance reading into canonical 7-decimal Stellar stroops,
+ * or null when the reading cannot be represented cleanly without precision loss.
+ *
+ * Soroban readings default to Stellar's 7-decimal base (`USDC_DECIMALS = 7`).
+ * When a Soroban token or adapter reports a different decimal base (for example
+ * 6 decimals vs Horizon's 7-decimal decimal string, which otherwise produces a
+ * silent 10x mismatch on failover), the integer units are rescaled with BigInt
+ * arithmetic so both sources produce identical 7-decimal stroops.
+ */
+export function normalizeUsdcBalanceToStroops(reading: UsdcBalanceReading): bigint | null {
+  if (reading.source === "horizon") {
+    return usdcToStroops(reading.balance);
+  }
+  const decimals = reading.decimals ?? USDC_DECIMALS;
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > MAX_SUPPORTED_TOKEN_DECIMALS) {
+    return null;
+  }
+  if (decimals === USDC_DECIMALS) {
+    return reading.stroops;
+  }
+  if (decimals < USDC_DECIMALS) {
+    return reading.stroops * 10n ** BigInt(USDC_DECIMALS - decimals);
+  }
+  const divisor = 10n ** BigInt(decimals - USDC_DECIMALS);
+  if (reading.stroops % divisor !== 0n) {
+    return null;
+  }
+  return reading.stroops / divisor;
+}
 
 /**
  * Convert any tagged balance reading into one canonical decimal USDC string.
  *
  * Returns null when a Horizon reading is not a decimal amount — an empty
- * balance field, an error payload that reached this far — so a malformed
- * reading is never silently treated as zero funds.
+ * balance field, an error payload that reached this far — or when a Soroban
+ * reading carries an unsupported decimal base or unrepresentable sub-stroop
+ * precision, so a malformed reading is never silently treated as zero funds.
  */
 export function normalizeUsdcBalance(reading: UsdcBalanceReading): string | null {
-  if (reading.source === "soroban") return stroopsToUsdc(reading.stroops);
-  const stroops = usdcToStroops(reading.balance);
+  const stroops = normalizeUsdcBalanceToStroops(reading);
   return stroops === null ? null : stroopsToUsdc(stroops);
 }
 

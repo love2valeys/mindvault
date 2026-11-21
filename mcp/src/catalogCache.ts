@@ -15,6 +15,15 @@
  */
 
 import { currentCatalogCacheScope } from "./catalogCacheScope.js";
+import {
+  isRetryableError,
+  isRetryableStatus,
+  retryAfterDelay,
+  retryPolicyFromEnv,
+  withRetry,
+  type RetryAttemptInfo,
+  type RetryPolicy,
+} from "./retry.js";
 
 export interface CatalogSnapshot {
   resources: unknown[];
@@ -130,8 +139,12 @@ export function isStale(savedAtMs: number, nowMs: number = Date.now()): boolean 
 }
 
 /** Record a successful catalog read. The raw resource array is snapshotted. */
-export function recordCatalogSnapshot(resources: unknown[]): void {
-  catalogs.set(currentCatalogCacheScope(), { resources, savedAtMs: Date.now() });
+export function recordCatalogSnapshot(
+  resources: unknown[],
+  scope: string = currentCatalogCacheScope(),
+  nowMs: number = Date.now(),
+): void {
+  catalogs.set(scope, { resources, savedAtMs: nowMs });
 }
 
 /**
@@ -141,8 +154,10 @@ export function recordCatalogSnapshot(resources: unknown[]): void {
  * An expired snapshot is dropped rather than merely hidden, so the memory is
  * released and a later call cannot resurrect it.
  */
-export function getCatalogSnapshot(nowMs: number = Date.now()): CatalogSnapshot | null {
-  const scope = currentCatalogCacheScope();
+export function getCatalogSnapshot(
+  nowMs: number = Date.now(),
+  scope: string = currentCatalogCacheScope(),
+): CatalogSnapshot | null {
   const catalog = catalogs.get(scope);
   if (!catalog) return null;
   if (isExpired(catalog.savedAtMs, nowMs)) {
@@ -153,8 +168,13 @@ export function getCatalogSnapshot(nowMs: number = Date.now()): CatalogSnapshot 
 }
 
 /** Record a successful preview read for a resource id. */
-export function recordPreviewSnapshot(resourceId: string, meta: unknown): void {
-  previews[`${currentCatalogCacheScope()}\u0000${resourceId}`] = { meta, savedAtMs: Date.now() };
+export function recordPreviewSnapshot(
+  resourceId: string,
+  meta: unknown,
+  scope: string = currentCatalogCacheScope(),
+  nowMs: number = Date.now(),
+): void {
+  previews[`${scope}\u0000${resourceId}`] = { meta, savedAtMs: nowMs };
 }
 
 /**
@@ -164,8 +184,9 @@ export function recordPreviewSnapshot(resourceId: string, meta: unknown): void {
 export function getPreviewSnapshot(
   resourceId: string,
   nowMs: number = Date.now(),
+  scope: string = currentCatalogCacheScope(),
 ): PreviewSnapshot | null {
-  const key = `${currentCatalogCacheScope()}\u0000${resourceId}`;
+  const key = `${scope}\u0000${resourceId}`;
   const snap = previews[key];
   if (!snap) return null;
   if (isExpired(snap.savedAtMs, nowMs)) {
@@ -221,6 +242,131 @@ export function catalogCacheLabel(
     `stale, results may be outdated. ` +
     `Confirm a specific resource on-chain with mindvault_registry_lookup when freshness matters.`
   );
+}
+
+/** Default retry-log label for catalog cache revalidation reads (`GET /resources`). */
+export const CATALOG_REVALIDATION_LABEL = "GET /resources";
+
+/** Minimal HTTP response shape accepted by {@link revalidateCatalogCache}. */
+export interface CatalogRevalidationResponse<T = unknown> {
+  ok: boolean;
+  status: number;
+  data: T;
+  headers?: Headers | Record<string, string>;
+}
+
+export interface RevalidateCatalogOptions<
+  T extends CatalogRevalidationResponse = CatalogRevalidationResponse,
+> {
+  /** Performs one idempotent `GET /resources` (or filtered query) attempt. */
+  fetcher: () => Promise<T>;
+  /** Retry policy for transient gateway/transport errors; defaults to env policy. */
+  policy?: RetryPolicy;
+  /** Label used in retry logs; defaults to {@link CATALOG_REVALIDATION_LABEL}. */
+  label?: string;
+  /** Cache scope key; defaults to `currentCatalogCacheScope()`. */
+  scope?: string;
+  /** Optional hook called before each retry delay for observability. */
+  onRetry?: (info: RetryAttemptInfo) => void;
+  /** Injectable clock, sleep, and RNG so backoff is deterministic in tests. */
+  now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+}
+
+export type RevalidateCatalogResult<
+  T extends CatalogRevalidationResponse = CatalogRevalidationResponse,
+> =
+  | {
+      revalidated: true;
+      resources: unknown[];
+      response: T;
+      attempts: number;
+    }
+  | {
+      revalidated: false;
+      snapshot: CatalogSnapshot | null;
+      reason: CatalogFallbackReason | null;
+      response?: T;
+      error?: unknown;
+      attempts: number;
+    };
+
+function readRetryAfterHeader(
+  headers: Headers | Record<string, string> | undefined,
+): string | null {
+  if (!headers) return null;
+  if (typeof (headers as Headers).get === "function") {
+    return (headers as Headers).get("retry-after");
+  }
+  for (const [key, value] of Object.entries(headers as Record<string, string>)) {
+    if (key.toLowerCase() === "retry-after") return value;
+  }
+  return null;
+}
+
+/**
+ * Revalidate the catalog cache (`GET /resources`) under bounded, jittered
+ * exponential backoff (#220).
+ *
+ * Transient gateway and throttling errors (408/425/429/5xx) and transport
+ * failures are retried with the same retry policy used for other idempotent
+ * reads (honouring `Retry-After`, clamped to `maxDelayMs`) so a single gateway
+ * blip does not pin a stale snapshot for a full TTL period.
+ *
+ * - On recovery, records the fresh snapshot immediately and returns it.
+ * - After exhausting retries on a retryable gateway/transport error, returns
+ *   the cached snapshot (if any and unexpired) alongside the accurate fallback
+ *   reason so callers can decide whether to serve stale data or report failure.
+ * - On non-retryable client errors (e.g. 400/401/403/404) or caller aborts,
+ *   stops immediately without retrying and never masks the error behind cache.
+ */
+export async function revalidateCatalogCache<
+  T extends CatalogRevalidationResponse = CatalogRevalidationResponse,
+>(opts: RevalidateCatalogOptions<T>): Promise<RevalidateCatalogResult<T>> {
+  const policy = opts.policy ?? retryPolicyFromEnv();
+  const label = opts.label ?? CATALOG_REVALIDATION_LABEL;
+  const scope = opts.scope ?? currentCatalogCacheScope();
+  const now = opts.now ?? Date.now;
+
+  let attempts = 0;
+  try {
+    const response = await withRetry(
+      () => {
+        attempts += 1;
+        return opts.fetcher();
+      },
+      {
+        policy,
+        label,
+        shouldRetryResult: (res) => !res.ok && isRetryableStatus(res.status),
+        describeResult: (res) => `HTTP ${res.status}`,
+        delayFromResult: (res) =>
+          retryAfterDelay(readRetryAfterHeader(res.headers), policy, now()),
+        onRetry: opts.onRetry,
+        sleep: opts.sleep,
+        random: opts.random,
+      },
+    );
+
+    if (response.ok) {
+      const resources = Array.isArray(response.data) ? response.data : [];
+      recordCatalogSnapshot(resources, scope, now());
+      return { revalidated: true, resources, response, attempts };
+    }
+
+    const reason: CatalogFallbackReason | null = isRetryableStatus(response.status)
+      ? { kind: "status", status: response.status }
+      : null;
+    const snapshot = reason ? getCatalogSnapshot(now(), scope) : null;
+    return { revalidated: false, snapshot, reason, response, attempts };
+  } catch (error) {
+    const reason: CatalogFallbackReason | null = isRetryableError(error)
+      ? { kind: "unreachable" }
+      : null;
+    const snapshot = reason ? getCatalogSnapshot(now(), scope) : null;
+    return { revalidated: false, snapshot, reason, error, attempts };
+  }
 }
 
 /**

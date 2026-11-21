@@ -32,8 +32,10 @@ import { CATALOG_MAX_LIMIT, CATALOG_SORT_VALUES } from "./catalogFilters.js";
 import { REGISTRY_LIST_MAX_LIMIT } from "./registryPagination.js";
 import { RECEIPT_EXPORT_MAX_LIMIT } from "./receipts.js";
 import { DEBUG_BUNDLE_MAX_AUDIT_LINES } from "./debugBundleSchema.js";
+import { RESET_CONFIRM_STRINGS, RESET_DECLINE_STRINGS } from "./resetGuard.js";
 import { TOOL_DEFINITIONS } from "./tools.js";
 import { MAX_SETTLEMENT_TIMEOUT_MS, MIN_SETTLEMENT_INTERVAL_MS } from "./settlement.js";
+import { StrKey } from "@stellar/stellar-sdk";
 
 // ── Spec model ────────────────────────────────────────────────────────────────
 
@@ -63,13 +65,7 @@ import { MAX_SETTLEMENT_TIMEOUT_MS, MIN_SETTLEMENT_INTERVAL_MS } from "./settlem
  *   - An empty array (`[]`) is valid and clears all tags from the resource.
  */
 export type ArgumentKind =
-  | "string"
-  | "enum"
-  | "flag"
-  | "hash"
-  | "tag_array"
-  | "string_array"
-  | "integer";
+  "string" | "enum" | "flag" | "hash" | "tag_array" | "string_array" | "integer";
 
 export interface ArgumentSpec {
   kind: ArgumentKind;
@@ -88,12 +84,25 @@ export interface ArgumentSpec {
   pattern?: RegExp;
   /** Human-readable description of `pattern`, used in the error message. */
   patternHint?: string;
+  /** Require a checksum-valid Stellar Ed25519 public key after shape validation. */
+  stellarAddress?: boolean;
   /**
    * Keep the canonical hex-only form of a digest instead of the
    * `"<algorithm>:<hex>"` spelling — `hash` only. Used where a downstream
    * service expects a bare digest (e.g. a Stellar transaction hash).
    */
   bareHex?: boolean;
+  /**
+   * Explicit allow-list of truthy string spellings — `flag` only (#221).
+   * When set, overrides the default generic `TRUE_STRINGS` set so widening
+   * generic flag parsing cannot widen a high-impact confirmation.
+   */
+  allowedTrueStrings?: readonly string[];
+  /**
+   * Explicit allow-list of falsy string spellings — `flag` only (#221).
+   * When set, overrides the default generic `FALSE_STRINGS` set.
+   */
+  allowedFalseStrings?: readonly string[];
 }
 
 export type ToolArgumentSpec = Record<string, ArgumentSpec>;
@@ -160,6 +169,20 @@ const CONFIRM_MAINNET: ArgumentSpec = { kind: "flag" };
 /** Confirmation flag for paid operations (see paidOperations.ts). */
 const CONFIRM_PAID: ArgumentSpec = { kind: "flag" };
 
+/**
+ * Confirmation flag codified against `resetGuard.ts` (#221).
+ *
+ * Uses the exact frozen `RESET_CONFIRM_STRINGS` and `RESET_DECLINE_STRINGS`
+ * vocabularies instead of the wider generic flag sets (`"on"` / `"off"`), so
+ * widening generic flag parsing cannot coerce an unintended string into `true`
+ * and bypass reset preview/echo mode.
+ */
+const RESET_CONFIRM: ArgumentSpec = {
+  kind: "flag",
+  allowedTrueStrings: RESET_CONFIRM_STRINGS,
+  allowedFalseStrings: RESET_DECLINE_STRINGS,
+};
+
 /** Preview flag: publish/buy report what they would do without paying. */
 const DRY_RUN: ArgumentSpec = { kind: "flag" };
 
@@ -169,6 +192,7 @@ const STELLAR_ADDRESS: ArgumentSpec = {
   maxLength: 56,
   pattern: /^G[A-Z2-7]{55}$/,
   patternHint: "a Stellar public key (G… , 56 chars)",
+  stellarAddress: true,
 };
 
 /** Metadata pointer (max 512 chars, supported prefix). */
@@ -265,12 +289,13 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
     network: { kind: "enum", values: ["testnet", "mainnet"], required: true },
   },
   mindvault_list_profiles: {},
-  mindvault_browse: { ...CATALOG_FILTER_ARGS, bypassCache: { kind: "flag" } },
+  mindvault_browse: {
+    ...CATALOG_FILTER_ARGS,
+    bypassCache: { kind: "flag" },
+    cursor: { kind: "string", maxLength: 512 },
+  },
   mindvault_search: { ...CATALOG_FILTER_ARGS, bypassCache: { kind: "flag" } },
   mindvault_preview: { resourceId: RESOURCE_ID, bypassCache: { kind: "flag" } },
-  mindvault_browse: { ...CATALOG_FILTER_ARGS, cursor: { kind: "string", maxLength: 512 } },
-  mindvault_search: { ...CATALOG_FILTER_ARGS },
-  mindvault_preview: { resourceId: RESOURCE_ID },
   mindvault_register: {
     name: { kind: "string", required: true, maxLength: 128 },
     email: {
@@ -316,6 +341,7 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
       max: MAX_SETTLEMENT_TIMEOUT_MS,
     },
     intervalMs: { kind: "integer", min: MIN_SETTLEMENT_INTERVAL_MS },
+    waitPolicy: { kind: "enum", values: ["return_after_submit", "wait_for_final_result"] },
     idempotencyKey: IDEMPOTENCY_KEY,
   },
   mindvault_purchase_status: {
@@ -349,6 +375,7 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
   },
   mindvault_agent_status: {},
   mindvault_registry_info: {},
+  mindvault_contract_preflight: {},
   mindvault_terms: {
     operation: { kind: "enum", required: true, values: ["get", "set"] },
     creator: STELLAR_ADDRESS,
@@ -378,23 +405,36 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
     right: { kind: "enum", values: ["testnet", "mainnet"], required: true },
     limit: { kind: "integer", min: 1, max: 100 },
   },
-  mindvault_tx_status: { txHash: { kind: "hash", required: true, bareHex: true } },
-  // `confirm` is what resetGuard.isResetConfirmed reads. It was advertised in
-  // ListTools and absent here, so every confirmed reset failed validation as an
-  // unknown argument and the tool was permanently stuck in preview mode (#596).
+  mindvault_tx_status: {
+    txHash: { kind: "hash", required: true, bareHex: true },
+    wait: { kind: "flag" },
+    timeoutMs: { kind: "integer", min: 0, max: MAX_SETTLEMENT_TIMEOUT_MS },
+    intervalMs: { kind: "integer", min: MIN_SETTLEMENT_INTERVAL_MS },
+  },
+  // `confirm` is codified against `resetGuard.ts`'s exact allow-list (#596, #221)
+  // so widened generic flag spellings like `"on"` cannot slip through into true.
   mindvault_reset: {
-    confirm: { kind: "flag" },
+    confirm: RESET_CONFIRM,
     all: { kind: "flag" },
     confirmMainnet: CONFIRM_MAINNET,
   },
-  mindvault_backup_state: { passphrase: PASSPHRASE, confirm: { kind: "flag" } },
+  mindvault_backup_state: { passphrase: PASSPHRASE, confirm: RESET_CONFIRM },
+  mindvault_preview_state_migration: {},
+  mindvault_apply_state_migration: { confirm: RESET_CONFIRM },
+  mindvault_export_state_selective: {},
+  mindvault_import_state_selective: {
+    blob: { kind: "string", required: true, maxLength: 131_072 },
+  },
   mindvault_resource_provenance: { resourceId: RESOURCE_ID },
   mindvault_resource_change_log: { resourceId: RESOURCE_ID },
   mindvault_restore_state: {
     blob: { kind: "string", required: true, maxLength: 1_048_576 },
     passphrase: PASSPHRASE,
   },
-  mindvault_metrics: { reset: { kind: "flag" } },
+  mindvault_metrics: {
+    reset: { kind: "flag" },
+    format: { kind: "enum", values: ["json", "otlp"] },
+  },
   mindvault_debug_bundle: {
     auditLogLines: { kind: "integer", min: 0, max: DEBUG_BUNDLE_MAX_AUDIT_LINES },
     includeEnvironment: { kind: "flag" },
@@ -430,6 +470,8 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
   mindvault_transfer_ownership: {
     resourceId: RESOURCE_ID,
     newCreator: { ...STELLAR_ADDRESS, required: true },
+    newTermsHash: { kind: "string", maxLength: 64 },
+    resetAttestation: { kind: "flag" },
     confirmMainnet: CONFIRM_MAINNET,
     confirmPaid: CONFIRM_PAID,
   },
@@ -487,6 +529,8 @@ export const TOOL_ARGUMENT_SPECS: Record<string, ToolArgumentSpec> = {
       patternHint: "a Stellar secret key (S… , 56 chars)",
     },
     profile: PROFILE_NAME,
+    network: { kind: "enum", values: ["testnet", "mainnet"] },
+    confirmAddress: STELLAR_ADDRESS,
     persist: { kind: "flag" },
     confirmMainnet: CONFIRM_MAINNET,
   },
@@ -759,19 +803,33 @@ function validateStringArray(
 function validateFlag(
   field: string,
   value: unknown,
+  spec: ArgumentSpec,
   issues: ValidationIssue[],
 ): boolean | undefined {
   if (typeof value === "boolean") return value;
   if (typeof value === "number" && (value === 0 || value === 1)) return value === 1;
   if (typeof value === "string") {
     const normalized = value.trim().toLowerCase();
-    if (TRUE_STRINGS.has(normalized)) return true;
-    if (FALSE_STRINGS.has(normalized)) return false;
+    const isTrue = spec.allowedTrueStrings
+      ? spec.allowedTrueStrings.includes(normalized)
+      : TRUE_STRINGS.has(normalized);
+    if (isTrue) return true;
+    const isFalse = spec.allowedFalseStrings
+      ? spec.allowedFalseStrings.includes(normalized)
+      : FALSE_STRINGS.has(normalized);
+    if (isFalse) return false;
   }
+  const allowedHint =
+    spec.allowedTrueStrings || spec.allowedFalseStrings
+      ? ` (allowed strings: ${[
+          ...(spec.allowedTrueStrings ?? []),
+          ...(spec.allowedFalseStrings ?? []),
+        ].join(", ")})`
+      : "";
   issues.push({
     field,
     code: "wrong_type",
-    message: `${field} must be a boolean (true/false); received ${typeName(value)}.`,
+    message: `${field} must be a boolean (true/false)${allowedHint}; received ${typeName(value)}.`,
   });
   return undefined;
 }
@@ -826,7 +884,19 @@ function validateString(
     });
     return undefined;
   }
+  if (spec.stellarAddress && !isValidStellarPublicKey(trimmed)) {
+    issues.push({
+      field,
+      code: "pattern_mismatch",
+      message: `${field} is not a valid Stellar public address.`,
+    });
+    return undefined;
+  }
   return trimmed;
+}
+
+export function isValidStellarPublicKey(value: unknown): value is string {
+  return typeof value === "string" && StrKey.isValidEd25519PublicKey(value);
 }
 
 function validateEnum(
@@ -988,7 +1058,7 @@ export function validateToolArgs(tool: string, rawArgs: unknown): ValidatedArgs 
 
     switch (fieldSpec.kind) {
       case "flag": {
-        const flag = validateFlag(field, value, issues);
+        const flag = validateFlag(field, value, fieldSpec, issues);
         if (flag !== undefined) out[field] = flag;
         break;
       }

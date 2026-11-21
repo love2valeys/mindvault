@@ -91,6 +91,12 @@ describe("createMindVaultServer", () => {
     );
   });
 
+  it("rejects resources without a reader", () => {
+    expect(() => createMindVaultServer(behaviour({ listResources: () => [] }))).toThrow(
+      /listResources and readResource must be supplied together/,
+    );
+  });
+
   it("declares prompt capability only when prompts are supplied", async () => {
     const withPrompts = createMindVaultServer(
       behaviour({
@@ -101,6 +107,23 @@ describe("createMindVaultServer", () => {
     const { client } = await connectClient(withPrompts);
 
     expect(await client.listPrompts()).toMatchObject({ prompts: [{ name: "p" }] });
+  });
+
+  it("advertises and reads resources when resource handlers are supplied", async () => {
+    const server = createMindVaultServer(
+      behaviour({
+        listResources: () => [
+          { uri: "mindvault://server/metadata", name: "Server Metadata", mimeType: "application/json" },
+        ],
+        readResource: (uri) => ({ uri, mimeType: "application/json", text: '{"status":"running"}' }),
+      }),
+    );
+    const { client } = await connectClient(server);
+
+    expect((await client.listResources()).resources).toHaveLength(1);
+    expect(await client.readResource({ uri: "mindvault://server/metadata" })).toMatchObject({
+      contents: [{ text: '{"status":"running"}' }],
+    });
   });
 });
 
@@ -151,6 +174,52 @@ describe("tools over a real session", () => {
     const result: any = await client.callTool({ name: "mindvault_echo", arguments: {} });
 
     expect(result.structuredContent).toEqual({ parsed: true });
+  });
+
+  it("does not send structured content that violates the advertised schema", async () => {
+    const { client } = await connectClient(
+      createMindVaultServer(
+        behaviour({
+          listTools: () => [
+            {
+              ...TOOL,
+              outputSchema: {
+                type: "object",
+                properties: { ok: { type: "boolean" } },
+                required: ["ok"],
+              },
+            },
+          ],
+          structuredResult: () => ({ secret: "sensitive" }),
+        }),
+      ),
+    );
+
+    const result: any = await client.callTool({ name: "mindvault_echo", arguments: {} });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    expect(result.content[0].text).not.toContain("sensitive");
+  });
+
+  it("omits incompatible troubleshooting content for schema-backed tool errors", async () => {
+    const { client } = await connectClient(
+      createMindVaultServer(
+        behaviour({
+          listTools: () => [{ ...TOOL, outputSchema: { type: "object", required: ["ok"] } }],
+          dispatchTool: async () => {
+            throw new Error("failed");
+          },
+          errorContent: () => ({ troubleshooting: "private diagnostic" }),
+        }),
+      ),
+    );
+
+    const result: any = await client.callTool({ name: "mindvault_echo", arguments: {} });
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toBeUndefined();
+    expect(result.content[0].text).not.toContain("private diagnostic");
   });
 
   it("omits structured content when there is none", async () => {

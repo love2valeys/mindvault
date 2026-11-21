@@ -1,6 +1,7 @@
 import {
   createRegistryClient,
   Errors as RegistryErrors,
+  getNetworkPreset,
   listResources,
   type Resource,
 } from "@mindvault/registry-client";
@@ -28,7 +29,13 @@ import { parseMetadataHash, describeMetadataPointerHash } from "../metadataHash.
 import { mainnetAllowedFromEnv, formatMainnetDiagnostics } from "../mainnetGuardrails.js";
 import { mockRegistryCount, mockRegistryList, mockRegistryLookup } from "../mock.js";
 import { type AgentWallet } from "../profiles.js";
-import { stroopsToUsdc } from "../usdcAmount.js";
+import {
+  compareUsdc,
+  normalizeUsdcBalance,
+  stroopsToUsdc,
+  trimUsdc,
+  usdcToStroops as toStroops,
+} from "../usdcAmount.js";
 
 export interface BalanceDetails {
   status: "missing" | "no-trustline" | "zero" | "funded";
@@ -95,8 +102,12 @@ export async function getBalanceDetails(publicKey: string): Promise<BalanceDetai
   const reserve = baseReserve + subentryCount * entryReserve;
   const available = Math.max(0, parseFloat(xlm) - reserve);
 
+  const usdcIssuer = getNetworkPreset(STELLAR_NETWORK).usdcClassicIssuer;
   const usdcBalance = balances.find(
-    (b: any) => b.asset_type === "credit_alphanum4" && b.asset_code === "USDC",
+    (b: any) =>
+      b.asset_type === "credit_alphanum4" &&
+      b.asset_code === "USDC" &&
+      b.asset_issuer === usdcIssuer,
   );
 
   if (!usdcBalance) {
@@ -111,9 +122,22 @@ export async function getBalanceDetails(publicKey: string): Promise<BalanceDetai
   }
 
   const usdc = usdcBalance.balance ?? "0";
-  const usdcFloat = parseFloat(usdc);
+  const normalized = normalizeUsdcBalance({ source: "horizon", balance: usdc });
 
-  if (usdcFloat === 0) {
+  if (normalized === null) {
+    return {
+      status: "zero",
+      xlmBalance: xlm,
+      xlmReserve: reserve.toFixed(1),
+      xlmAvailable: available.toFixed(7),
+      usdcBalance: "0",
+      message:
+        `Horizon reported a USDC balance this server could not read ("${String(usdc).slice(0, 32)}"), ` +
+        `so it is treated as zero rather than guessed at. Re-run mindvault_wallet_info; if it persists, the Horizon endpoint is returning an unexpected balance format.`,
+    };
+  }
+
+  if (toStroops(normalized) === 0n) {
     return {
       status: "zero",
       xlmBalance: xlm,
@@ -159,9 +183,19 @@ export async function getAccountBalances(
   if (!res.ok) return { usdc: "0", native: "0", funded: false };
   const data: any = await res.json();
   const balances: any[] = data.balances ?? [];
-  const usdc = balances.find((b) => b.asset_type === "credit_alphanum4" && b.asset_code === "USDC");
+  const usdcIssuer = getNetworkPreset(STELLAR_NETWORK).usdcClassicIssuer;
+  const usdc = balances.find(
+    (b: any) =>
+      b.asset_type === "credit_alphanum4" &&
+      b.asset_code === "USDC" &&
+      b.asset_issuer === usdcIssuer,
+  );
   const native = balances.find((b) => b.asset_type === "native");
-  return { usdc: usdc?.balance ?? "0", native: native?.balance ?? "0", funded: true };
+  const normalizedUsdc =
+    usdc?.balance != null
+      ? normalizeUsdcBalance({ source: "horizon", balance: usdc.balance })
+      : null;
+  return { usdc: normalizedUsdc ?? "0", native: native?.balance ?? "0", funded: true };
 }
 
 export function formatResource(r: any): string {
@@ -182,14 +216,24 @@ export async function insufficientFundsMessage(
   const need = typeof amountNeeded === "number" ? amountNeeded : parseFloat(amountNeeded);
   if (!Number.isFinite(need)) return null;
   const balance = await getUsdcBalance(wallet.publicKey);
-  const have = parseFloat(balance);
-  if (!Number.isFinite(have) || have >= need) return null;
-  const shortfall = need - have;
+  const needAmount = need.toFixed(7);
+  const comparison = compareUsdc(balance, needAmount);
+  if (comparison === null) {
+    return [
+      `Cannot confirm the USDC balance before paying to ${action}.`,
+      `Amount needed: ${trimUsdc(needAmount)} USDC`,
+      `Reported balance: "${String(balance).slice(0, 32)}" could not be read as a USDC amount.`,
+      `No payment was submitted. Check the wallet with mindvault_wallet_info and retry.`,
+    ].join("\n");
+  }
+  if (comparison >= 0) return null;
+
+  const shortfallStroops = (toStroops(needAmount) ?? 0n) - (toStroops(balance) ?? 0n);
   return [
     `Insufficient USDC to ${action}.`,
-    `Amount needed: ${need} USDC`,
-    `Current balance: ${have} USDC`,
-    `Shortfall: ${shortfall.toFixed(7).replace(/\.?0+$/, "")} USDC`,
+    `Amount needed: ${trimUsdc(needAmount)} USDC`,
+    `Current balance: ${trimUsdc(balance)} USDC`,
+    `Shortfall: ${trimUsdc(stroopsToUsdc(shortfallStroops))} USDC`,
     `Fund ${wallet.publicKey} with the shortfall and retry.`,
   ].join("\n");
 }
@@ -360,7 +404,7 @@ export async function registryCount(creator?: string): Promise<string> {
 
   let count: number;
   let listedCount: number;
-  let creatorCount: number | null = null;
+  let creatorCount: number | undefined;
 
   try {
     const countTx = await client.count();
@@ -376,10 +420,7 @@ export async function registryCount(creator?: string): Promise<string> {
   }
 
   try {
-    // listed_count is present in the Rust contract but not yet included in the
-    // generated TypeScript bindings; access via `as any` until bindings are
-    // regenerated with `pnpm contract:bindings`.
-    const listedTx = await (client as any).listed_count();
+    const listedTx = await client.listed_count();
     listedCount = Number(listedTx.result);
   } catch (err: unknown) {
     throw mcpError(
@@ -393,7 +434,7 @@ export async function registryCount(creator?: string): Promise<string> {
 
   if (creator) {
     try {
-      const creatorTx = await (client as any).creator_resource_count({ creator });
+      const creatorTx = await client.creator_resource_count({ creator });
       creatorCount = Number(creatorTx.result);
     } catch (err: unknown) {
       throw mcpError(
@@ -406,28 +447,15 @@ export async function registryCount(creator?: string): Promise<string> {
     }
   }
 
-  const payload: {
-    source: string;
-    count: number;
-    listedCount: number;
-    creatorCount?: number;
-    creator?: string;
-    contract: string;
-    network: string;
-    rpc: string;
-  } = {
+  const payload = {
     source: "on-chain",
     count,
     listedCount,
+    ...(creator !== undefined && creatorCount !== undefined ? { creator, creatorCount } : {}),
     contract: REGISTRY_CONTRACT_ID,
     network: REGISTRY_NETWORK_PASSPHRASE,
     rpc: SOROBAN_RPC_URL,
   };
-
-  if (creator != null) {
-    payload.creator = creator;
-    payload.creatorCount = creatorCount!;
-  }
 
   return JSON.stringify(payload, null, 2);
 }

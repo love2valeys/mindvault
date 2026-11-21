@@ -80,3 +80,22 @@ export function resourceChangeLog(resourceId: string): string {
   );
   return JSON.stringify({ resourceId, count: changes.length, changes }, null, 2);
 }
+
+
+/**
+ * Surfaces recent price and metadata changes for a resource from history and audit records (#175)
+ */
+export function queryResourcePriceAndMetadataHistory(
+  resourceId: string,
+  limit: number = 50,
+): { resourceId: string; count: number; changes: ResourceHistoryEvent[] } {
+  const allChanges = readResourceHistory(resourceId).filter((event) =>
+    ["price", "metadata", "created"].includes(event.kind),
+  );
+  const limited = allChanges.slice(-Math.max(1, limit));
+  return {
+    resourceId,
+    count: limited.length,
+    changes: limited,
+  };
+}

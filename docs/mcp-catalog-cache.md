@@ -79,6 +79,14 @@ as profile state. There is deliberately no filesystem use, which keeps "no
 cache present" deterministic and independent of anything an earlier run left
 behind.
 
+## Concurrent reads (#86)
+
+Concurrent reads for the same URL and cache scope share one in-flight request,
+including its normal offline-snapshot fallback. Different URLs or profile,
+network, contract, or API-origin scopes remain independent. The shared request
+is removed on either success or failure, so a rejected fetch is never retained
+as a cache entry and a later call can retry it.
+
 ## When the snapshot is served (#837)
 
 The cache answers for one situation: **the catalog could not answer.** That is
@@ -118,4 +126,5 @@ request against data that could never reflect it.
 - [`mcp/src/catalogCacheTtl.test.ts`](../mcp/src/catalogCacheTtl.test.ts) —
   configuration parsing, the TTL/max-age interaction, expiry and eviction
 - [`mcp/src/index.test.ts`](../mcp/src/index.test.ts) — which failures serve the
-  snapshot and which surface (`offline catalog cache fallback`)
+  snapshot and which surface (`offline catalog cache fallback`), plus
+  simultaneous request coalescing and failed-request cleanup

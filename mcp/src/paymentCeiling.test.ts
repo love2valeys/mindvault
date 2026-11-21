@@ -3,7 +3,9 @@ import {
   DEFAULT_MAX_AUTO_PAY_USDC,
   assertAutoPaymentWithinCeiling,
   assertTransactionFeeWithinCeiling,
+  checkAutoPaymentCeiling,
   recomputePaymentCeilingAfterPriceChange,
+  resolveAutoPaymentCeiling,
 } from "./paymentCeiling.js";
 import { MIN_USDC_BALANCE, MIN_NATIVE_XLM, assertMinimumBalance } from "./paymentPreflight.js";
 
@@ -29,6 +31,26 @@ describe("automatic x402 payment ceiling", () => {
     expect(() =>
       assertAutoPaymentWithinCeiling({ price: "5.01", maxAutoPayUsdc: "5.01", env }),
     ).not.toThrow();
+  });
+
+  it("treats unset and blank MINDVAULT_MAX_AUTO_PAY_USDC identically using the 10 USDC default", () => {
+    for (const testEnv of [
+      {} as NodeJS.ProcessEnv,
+      { MINDVAULT_MAX_AUTO_PAY_USDC: "" } as NodeJS.ProcessEnv,
+      { MINDVAULT_MAX_AUTO_PAY_USDC: "   " } as NodeJS.ProcessEnv,
+    ]) {
+      const resolved = resolveAutoPaymentCeiling(testEnv);
+      expect(resolved.isDefault).toBe(true);
+      expect(resolved.value).toBe("10");
+      expect(checkAutoPaymentCeiling({ price: "9.9999999", env: testEnv })).toEqual({
+        allowed: true,
+        ceiling: "10",
+        isDefaultCeiling: true,
+      });
+      expect(() =>
+        assertAutoPaymentWithinCeiling({ price: "10.0000000", env: testEnv }),
+      ).not.toThrow();
+    }
   });
 });
 

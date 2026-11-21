@@ -27,7 +27,13 @@ import {
 } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
-import { STATE_VERSION, type ProfileState, type WalletProfile } from "./profiles.js";
+import {
+  isValidProfileName,
+  migrateState,
+  STATE_VERSION,
+  type ProfileState,
+  type WalletProfile,
+} from "./profiles.js";
 
 const STATE_DIR = join(homedir(), ".mindvault");
 const STATE_FILE = join(STATE_DIR, "state.json");
@@ -194,8 +200,13 @@ export function restoreState(
   }
   let state: ProfileState;
   try {
-    state = normalizePersisted(JSON.parse(plaintext));
-  } catch {
+    assertNoDuplicateJsonKeys(plaintext);
+    state = validateRestoredState(JSON.parse(plaintext) as unknown);
+  } catch (err) {
+    if (err instanceof StateBackupError) throw err;
+    if (err instanceof Error && err.message.startsWith("Duplicate field at ")) {
+      throw new StateBackupError(`Backup contents are not valid state: ${err.message}`);
+    }
     throw new StateBackupError("Backup contents are not valid state.");
   }
   if (options.expectedNetwork) {
@@ -252,6 +263,322 @@ function normalizePersisted(raw: unknown): ProfileState {
   return { version: STATE_VERSION, activeProfile, profiles };
 }
 
+function validateRestoredState(raw: unknown): ProfileState {
+  const issues: string[] = [];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new StateBackupError("Backup contents are not valid state: state must be an object.");
+  }
+  const obj = raw as Record<string, unknown>;
+  for (const field of Object.keys(obj)) {
+    if (!["version", "activeProfile", "profiles"].includes(field)) {
+      issues.push(`${field}: unexpected field.`);
+    }
+  }
+  if (obj.version !== STATE_VERSION) issues.push(`version: expected ${STATE_VERSION}.`);
+  if (typeof obj.activeProfile !== "string" || !isValidProfileName(obj.activeProfile)) {
+    issues.push("activeProfile: expected a valid profile identifier.");
+  }
+  if (!obj.profiles || typeof obj.profiles !== "object" || Array.isArray(obj.profiles)) {
+    issues.push("profiles: expected an object keyed by profile identifier.");
+  }
+
+  const profiles: Record<string, WalletProfile> = {};
+  const walletOwners = new Map<string, string>();
+  if (obj.profiles && typeof obj.profiles === "object" && !Array.isArray(obj.profiles)) {
+    for (const [name, value] of Object.entries(obj.profiles as Record<string, unknown>)) {
+      if (!isValidProfileName(name)) {
+        issues.push(`profiles.${name}: invalid profile identifier.`);
+        continue;
+      }
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        issues.push(`profiles.${name}: expected an object.`);
+        continue;
+      }
+      const profileInput = value as Record<string, unknown>;
+      const profile: WalletProfile = {};
+      for (const field of Object.keys(profileInput)) {
+        if (!["wallet", "apiKey", "network"].includes(field)) {
+          issues.push(`profiles.${name}.${field}: unexpected field.`);
+        }
+      }
+      if ("wallet" in profileInput) {
+        const wallet = profileInput.wallet;
+        if (!wallet || typeof wallet !== "object" || Array.isArray(wallet)) {
+          issues.push(`profiles.${name}.wallet: expected an object.`);
+        } else {
+          const candidate = wallet as Record<string, unknown>;
+          for (const field of Object.keys(candidate)) {
+            if (!["publicKey", "secretKey"].includes(field)) {
+              issues.push(`profiles.${name}.wallet.${field}: unexpected field.`);
+            }
+          }
+          if (typeof candidate.publicKey !== "string" || candidate.publicKey.length === 0) {
+            issues.push(`profiles.${name}.wallet.publicKey: expected a non-empty string.`);
+          }
+          if (typeof candidate.secretKey !== "string" || candidate.secretKey.length === 0) {
+            issues.push(`profiles.${name}.wallet.secretKey: expected a non-empty string.`);
+          }
+          if (
+            typeof candidate.publicKey === "string" &&
+            candidate.publicKey.length > 0 &&
+            typeof candidate.secretKey === "string" &&
+            candidate.secretKey.length > 0
+          ) {
+            const owner = walletOwners.get(candidate.publicKey);
+            if (owner) {
+              issues.push(`profiles.${name}.wallet.publicKey: conflicts with profile "${owner}".`);
+            } else {
+              walletOwners.set(candidate.publicKey, name);
+            }
+            profile.wallet = {
+              publicKey: candidate.publicKey,
+              secretKey: candidate.secretKey,
+            };
+          }
+        }
+      }
+      if ("apiKey" in profileInput) {
+        if (typeof profileInput.apiKey !== "string" || profileInput.apiKey.length === 0) {
+          issues.push(`profiles.${name}.apiKey: expected a non-empty string.`);
+        } else profile.apiKey = profileInput.apiKey;
+      }
+      if ("network" in profileInput) {
+        if (profileInput.network !== "testnet" && profileInput.network !== "mainnet") {
+          issues.push(`profiles.${name}.network: expected "testnet" or "mainnet".`);
+        } else profile.network = profileInput.network;
+      }
+      profiles[name] = profile;
+    }
+  }
+  if (
+    typeof obj.activeProfile === "string" &&
+    isValidProfileName(obj.activeProfile) &&
+    obj.profiles &&
+    typeof obj.profiles === "object" &&
+    !Array.isArray(obj.profiles) &&
+    !(obj.activeProfile in (obj.profiles as Record<string, unknown>))
+  ) {
+    issues.push("activeProfile: must name an entry in profiles.");
+  }
+  if (issues.length > 0) {
+    throw new StateBackupError(`Backup contents are not valid state: ${issues.join(" ")}`);
+  }
+  return {
+    version: STATE_VERSION,
+    activeProfile: obj.activeProfile as string,
+    profiles,
+  };
+}
+
+function assertNoDuplicateJsonKeys(source: string): void {
+  let index = 0;
+  const skipWhitespace = () => {
+    while (/\s/.test(source[index] ?? "")) index++;
+  };
+  const parseString = (): string => {
+    const start = index++;
+    while (index < source.length) {
+      if (source[index] === "\\") index += 2;
+      else if (source[index++] === '"') return JSON.parse(source.slice(start, index)) as string;
+    }
+    throw new Error("Invalid JSON string.");
+  };
+  const parseValue = (path: string): void => {
+    skipWhitespace();
+    if (source[index] === "{") {
+      index++;
+      skipWhitespace();
+      const keys = new Set<string>();
+      if (source[index] === "}") {
+        index++;
+        return;
+      }
+      while (index < source.length) {
+        skipWhitespace();
+        if (source[index] !== '"') throw new Error("Invalid JSON object key.");
+        const key = parseString();
+        if (keys.has(key)) throw new Error(`Duplicate field at ${path}.${key}.`);
+        keys.add(key);
+        skipWhitespace();
+        if (source[index++] !== ":") throw new Error("Invalid JSON object.");
+        parseValue(`${path}.${key}`);
+        skipWhitespace();
+        const delimiter = source[index++];
+        if (delimiter === "}") return;
+        if (delimiter !== ",") throw new Error("Invalid JSON object.");
+      }
+      throw new Error("Invalid JSON object.");
+    }
+    if (source[index] === "[") {
+      index++;
+      skipWhitespace();
+      if (source[index] === "]") {
+        index++;
+        return;
+      }
+      let item = 0;
+      while (index < source.length) {
+        parseValue(`${path}[${item++}]`);
+        skipWhitespace();
+        const delimiter = source[index++];
+        if (delimiter === "]") return;
+        if (delimiter !== ",") throw new Error("Invalid JSON array.");
+      }
+      throw new Error("Invalid JSON array.");
+    }
+    if (source[index] === '"') {
+      parseString();
+      return;
+    }
+    const start = index;
+    while (index < source.length && !/[\s,}\]]/.test(source[index])) index++;
+    if (index === start) throw new Error("Invalid JSON value.");
+  };
+
+  parseValue("$");
+  skipWhitespace();
+  if (index !== source.length) throw new Error("Unexpected trailing JSON.");
+}
+
+export interface SelectiveStateExport {
+  version: 1;
+  activeProfile: string;
+  profiles: Record<string, { network?: "testnet" | "mainnet" }>;
+}
+
+export function exportSelectiveState(state: ProfileState): string {
+  const profiles: SelectiveStateExport["profiles"] = {};
+  for (const name of Object.keys(state.profiles).sort()) {
+    const network = state.profiles[name].network;
+    profiles[name] = network ? { network } : {};
+  }
+  return JSON.stringify(
+    { version: 1, activeProfile: state.activeProfile, profiles } satisfies SelectiveStateExport,
+    null,
+    2,
+  );
+}
+
+export function importSelectiveState(blob: string, current: ProfileState): ProfileState {
+  let raw: unknown;
+  try {
+    assertNoDuplicateJsonKeys(blob);
+    raw = JSON.parse(blob) as unknown;
+  } catch {
+    throw new StateBackupError("Selective export is not valid JSON or contains duplicate fields.");
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new StateBackupError("Selective export must be an object.");
+  }
+  const input = raw as Record<string, unknown>;
+  const issues: string[] = [];
+  if (input.version !== 1) issues.push("version: expected 1.");
+  if (typeof input.activeProfile !== "string" || !isValidProfileName(input.activeProfile)) {
+    issues.push("activeProfile: expected a valid profile identifier.");
+  }
+  if (!input.profiles || typeof input.profiles !== "object" || Array.isArray(input.profiles)) {
+    issues.push("profiles: expected an object keyed by profile identifier.");
+  }
+  const imported =
+    input.profiles && typeof input.profiles === "object" && !Array.isArray(input.profiles)
+      ? (input.profiles as Record<string, unknown>)
+      : {};
+  for (const [name, profile] of Object.entries(imported)) {
+    if (!isValidProfileName(name)) issues.push(`profiles.${name}: invalid profile identifier.`);
+    if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
+      issues.push(`profiles.${name}: expected an object.`);
+      continue;
+    }
+    const fields = profile as Record<string, unknown>;
+    if (Object.keys(fields).some((field) => field !== "network")) {
+      issues.push(`profiles.${name}: only the network preference is allowed.`);
+    }
+    if ("network" in fields && fields.network !== "testnet" && fields.network !== "mainnet") {
+      issues.push(`profiles.${name}.network: expected "testnet" or "mainnet".`);
+    }
+  }
+  if (
+    typeof input.activeProfile === "string" &&
+    isValidProfileName(input.activeProfile) &&
+    !(input.activeProfile in imported)
+  ) {
+    issues.push("activeProfile: must name an entry in profiles.");
+  }
+  if (issues.length) throw new StateBackupError(`Invalid selective export: ${issues.join(" ")}`);
+
+  const profiles = { ...current.profiles };
+  for (const [name, value] of Object.entries(imported)) {
+    const existing = profiles[name] ?? {};
+    const network = (value as { network?: "testnet" | "mainnet" }).network;
+    profiles[name] = { ...existing, ...(network ? { network } : {}) };
+  }
+  return {
+    version: STATE_VERSION,
+    activeProfile: input.activeProfile as string,
+    profiles,
+  };
+}
+
+export function previewPersistedStateMigration(): string {
+  let rawText: string;
+  try {
+    rawText = readFileSync(STATE_FILE, "utf8");
+  } catch {
+    throw new StateBackupError("No readable state file found to preview migration.");
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(rawText) as unknown;
+  } catch {
+    throw new StateBackupError("State file is corrupted and cannot be migrated.");
+  }
+  const result = migrateState(raw);
+  if (!result.migrated) {
+    return `No state migration is pending. Current schema version: ${STATE_VERSION}.`;
+  }
+  const legacy = result.legacy as Record<string, unknown>;
+  const changes = [
+    "schema version: legacy -> 1",
+    "profile names: single wallet -> default",
+    ...(legacy.wallet ? ["wallet fields: moved to profiles.default.wallet"] : []),
+    ...(legacy.apiKey ? ["publisher API key: moved to profiles.default.apiKey"] : []),
+  ];
+  return [
+    "Migration preview (read-only).",
+    `Migration version: legacy single-wallet -> profile schema v${STATE_VERSION}.`,
+    `Changes: ${changes.join("; ")}.`,
+    `Backup: will be created as a mode-0600 file before applying.`,
+    "No state was changed.",
+  ].join("\n");
+}
+
+export function persistStateWithMigrationBackup(state: ProfileState): string | null {
+  let backupPath: string | null = null;
+  if (existsSync(STATE_FILE)) {
+    try {
+      const rawText = readFileSync(STATE_FILE, "utf8");
+      const result = migrateState(JSON.parse(rawText) as unknown);
+      if (result.migrated) {
+        backupPath =
+          `${STATE_FILE}.migration-v${STATE_VERSION}-${Date.now()}-` +
+          `${randomBytes(4).toString("hex")}.backup`;
+        writeAtomically(backupPath, rawText, 0o600);
+      }
+    } catch (err) {
+      if (err instanceof StateBackupError) throw err;
+      throw new StateBackupError(`Could not prepare state migration backup: ${err}`);
+    }
+  }
+  try {
+    writeAtomically(STATE_FILE, JSON.stringify(state, null, 2), 0o600);
+  } catch (err) {
+    throw new StateBackupError(
+      `State migration was not applied; the original file is intact: ${err}`,
+    );
+  }
+  return backupPath;
+}
+
 /**
  * Write bytes to a temp file in the same directory and atomically rename it over
  * the destination to avoid partial writes. The destination is never left half-
@@ -266,7 +593,7 @@ export function writeAtomically(
   const dir = dirname(filePath);
   mkdirSync(dir, { recursive: true });
 
-  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
   const writeSync = ops.writeFileSync ?? writeFileSync;
   const rename = ops.renameSync ?? renameSync;
   const chmod = ops.chmodSync ?? chmodSync;
@@ -275,8 +602,8 @@ export function writeAtomically(
 
   try {
     writeSync(tempPath, data, { mode });
+    chmod(tempPath, mode);
     rename(tempPath, filePath);
-    chmod(filePath, mode);
   } catch (err) {
     try {
       if (pathExists(tempPath)) remove(tempPath);

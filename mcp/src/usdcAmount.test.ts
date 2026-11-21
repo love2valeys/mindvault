@@ -12,6 +12,7 @@ import {
   compareUsdc,
   isUsdcDecimal,
   normalizeUsdcBalance,
+  normalizeUsdcBalanceToStroops,
   stroopsToUsdc,
   sumUsdc,
   trimUsdc,
@@ -115,6 +116,40 @@ describe("normalizeUsdcBalance", () => {
   it("accepts a zero balance from either source", () => {
     expect(normalizeUsdcBalance({ source: "horizon", balance: "0" })).toBe("0.0000000");
     expect(normalizeUsdcBalance({ source: "soroban", stroops: 0n })).toBe("0.0000000");
+  });
+
+  it("rescales 6-decimal Soroban USDC units to match Horizon's 7-decimal stroops without a 10x error", () => {
+    const fromSoroban6 = normalizeUsdcBalance({
+      source: "soroban",
+      stroops: 12_500_000n,
+      decimals: 6,
+    });
+    const fromSoroban7 = normalizeUsdcBalance({
+      source: "soroban",
+      stroops: 125_000_000n,
+      decimals: 7,
+    });
+    const fromHorizon = normalizeUsdcBalance({ source: "horizon", balance: "12.5000000" });
+
+    expect(fromSoroban6).toBe("12.5000000");
+    expect(fromSoroban6).toBe(fromSoroban7);
+    expect(fromSoroban6).toBe(fromHorizon);
+    expect(
+      normalizeUsdcBalanceToStroops({ source: "soroban", stroops: 12_500_000n, decimals: 6 }),
+    ).toBe(125_000_000n);
+    expect(normalizeUsdcBalanceToStroops({ source: "horizon", balance: "12.5000000" })).toBe(
+      125_000_000n,
+    );
+  });
+
+  it("rejects invalid Soroban decimals or lossy sub-stroop precision", () => {
+    expect(normalizeUsdcBalance({ source: "soroban", stroops: 100n, decimals: -1 })).toBeNull();
+    expect(normalizeUsdcBalance({ source: "soroban", stroops: 100n, decimals: 6.5 })).toBeNull();
+    expect(normalizeUsdcBalance({ source: "soroban", stroops: 100n, decimals: 19 })).toBeNull();
+    expect(normalizeUsdcBalance({ source: "soroban", stroops: 105n, decimals: 8 })).toBeNull();
+    expect(normalizeUsdcBalance({ source: "soroban", stroops: 120n, decimals: 8 })).toBe(
+      "0.0000012",
+    );
   });
 });
 

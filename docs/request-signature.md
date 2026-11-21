@@ -26,7 +26,7 @@ BODY_SHA256_HEX
 ```
 
 - **METHOD** — uppercase HTTP verb (`POST`, `DELETE`, …)
-- **PATH** — path and query only (e.g. `/resources/abc/register`, no scheme/host)
+- **PATH** — the complete path and query string exactly as sent (e.g. `/resources/abc/register?page=2&sort=created`, no scheme/host). Query parameters, their order, and encoding are covered by the signature; changing any of them invalidates it.
 - **TIMESTAMP** — same value as the `X-Timestamp` header (string)
 - **BODY_SHA256_HEX** — SHA-256 hex digest of the request body (see below)
 - **IDEMPOTENCY_KEY** — only when the `Idempotency-Key` header is sent

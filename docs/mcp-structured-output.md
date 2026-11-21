@@ -15,6 +15,12 @@ This follows the MCP 2025-06-18
 contract: a tool that declares `outputSchema` must return conforming
 `structuredContent` on success.
 
+The server validates each structured success immediately before sending it.
+Contract mismatches are logged with the tool name and schema paths only; the
+handler payload is not logged or returned. An invalid or missing structured
+result becomes a generic tool error. Failures do not include `structuredContent`
+unless it conforms to the success schema.
+
 ## Result contract
 
 **Success, structured tool:**
@@ -39,13 +45,17 @@ When a structured tool returns prose instead of JSON (insufficient funds,
 verification rejected, missing tx hash), the text is unchanged and
 `structuredContent` is `{ "status": "text", "message": "<same text>" }`.
 
+For `mindvault_buy`, receipt details are nested under `after.receipt` when
+available. The receipt and its fields may be absent or `null` when the payment
+settles only partially; any fields that are present may also be `null`.
+
 ## Which tools emit a payload
 
-| Group         | Tools                                                                                                                                     | Typical fields                                                                        |
-| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Group         | Tools                                                                                                                                     | Typical fields                                                                                                                                                                    |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Catalog       | `browse`, `search`, `batch_catalog_lookup`, `preview_metadata_hash`                                                                       | `items[]` (`id`, `title`, `price`, `description`, `accessUrl`), `notice`, `truncated`; batch adds `requested`, `foundCount`, `missing`; hash preview returns `pointer` + `report` |
-| Wallet        | `setup_wallet`, `import_wallet`, `wallet_info`, `use_profile`, `list_profiles`                                                            | `address`, `profile`, balances                                                        |
-| JSON handlers | `preview`, `publish`, `buy`, `publish_status`, `purchase_history`, `export_receipts`, registry reads/mutations, `tx_status`, `metrics`, … | existing JSON object, also as `structuredContent`                                     |
+| Wallet        | `setup_wallet`, `import_wallet`, `wallet_info`, `use_profile`, `list_profiles`                                                            | `address`, `profile`, balances                                                                                                                                                    |
+| JSON handlers | `preview`, `publish`, `buy`, `publish_status`, `purchase_history`, `export_receipts`, registry reads/mutations, `tx_status`, `metrics`, … | existing JSON object, also as `structuredContent`                                                                                                                                 |
 
 Text-only: `check_bindings`, `reset`, `backup_state`, `restore_state`,
 `verify_install`, `registry_health`, `check_state_permissions`, `register`,

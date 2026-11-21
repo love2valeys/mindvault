@@ -28,6 +28,11 @@
 
 import { redactSecrets } from "./diagnostics.js";
 import { categorizeStatus, type ErrorCategory, type MappedError } from "./errorMapping.js";
+import {
+  checkWalletIntegrity,
+  type DerivePublicKey,
+  type WalletIntegrityCode,
+} from "./sponsoredWallet.js";
 
 /** What kind of outage the sponsored-account service is having. */
 export type SponsoredOutageKind =
@@ -362,6 +367,25 @@ export function withSponsoredDiagnostics(
   };
 }
 
+/** Stellar Ed25519 public key shape (public address, safe to surface in diagnostics). */
+const STELLAR_PUBLIC_KEY = /^G[A-Z2-7]{55}$/;
+
+/** Body fields that may carry a funded address on a half-completed error response. */
+const ADDRESS_HINT_FIELDS = ["publicKey", "address", "account"] as const;
+
+function extractAddressHint(data: unknown): string | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const obj = data as Record<string, unknown>;
+  for (const field of ADDRESS_HINT_FIELDS) {
+    const value = obj[field];
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (STELLAR_PUBLIC_KEY.test(trimmed)) return trimmed;
+    }
+  }
+  return null;
+}
+
 /**
  * Map a non-ok response from the sponsored-account service into a fully
  * diagnosed error. Unlike the generic `mapHttpError`, the detail is drawn only
@@ -377,14 +401,27 @@ export function mapSponsoredHttpFailure(input: {
   endpoint?: string;
   now?: number;
 }): MappedError {
+  const category = categorizeStatus(input.status);
   const mapped: MappedError = {
     source: "sponsored",
-    category: categorizeStatus(input.status),
+    category,
     status: input.status,
     summary: `${input.operation}: ${sponsoredFailureDetail(input.data)}`,
     action: "",
   };
-  return withSponsoredDiagnostics(mapped, input);
+  const diagnosed = withSponsoredDiagnostics(mapped, input);
+  const kind = classify(category, input.status);
+  const unownedAddress = MAY_HAVE_BEEN_PROCESSED.has(kind) ? extractAddressHint(input.data) : null;
+  if (!unownedAddress) return diagnosed;
+  return {
+    ...diagnosed,
+    action: [
+      diagnosed.action,
+      `The failed response referenced address ${unownedAddress}, which was NOT persisted and is NOT owned by the local keystore — do not treat it as an active or spendable wallet.`,
+    ]
+      .filter(Boolean)
+      .join(" "),
+  };
 }
 
 /**
@@ -410,4 +447,144 @@ export function mapSponsoredTransportFailure(input: {
     },
     { serviceUrl: input.serviceUrl, endpoint: input.endpoint },
   );
+}
+
+/** Ownership state of a sponsored wallet relative to the local keystore (#218). */
+export type SponsoredWalletDiagnosticStatus = "owned" | "stale_unowned" | "missing";
+
+/** Structured diagnostic comparing a reported/stored sponsored wallet to the local keystore. */
+export interface SponsoredWalletDiagnostic {
+  status: SponsoredWalletDiagnosticStatus;
+  /** True only when the local keystore holds a valid secret that derives the address. */
+  owned: boolean;
+  /** True when a funded/reported or stored address is not owned by the local keystore. */
+  stale: boolean;
+  /** The address reported by the sponsored service or stored in the profile, if any. */
+  reportedAddress: string | null;
+  /** The address actually derivable from the local keystore's secret, if any. */
+  localOwnedAddress: string | null;
+  /** Integrity failure code when the local keystore entry failed verification. */
+  integrityCode?: WalletIntegrityCode;
+  /** Deterministic, secret-free diagnostic summary. */
+  summary: string;
+  /** Actionable next steps for the operator or agent. */
+  guidance: string[];
+}
+
+/**
+ * Verify whether a sponsored-account address (from a half-completed creation or
+ * a stored profile) is actually owned by the local keystore (#218).
+ *
+ * When creation times out after bank funding but before wallet persistence,
+ * diagnostics must never report the funded address as a usable local wallet.
+ */
+export function diagnoseSponsoredWallet(input: {
+  reportedAddress?: string | null;
+  localWallet?: { publicKey?: unknown; secretKey?: unknown } | null;
+  derivePublicKey: DerivePublicKey;
+}): SponsoredWalletDiagnostic {
+  const reportedAddress =
+    typeof input.reportedAddress === "string" && input.reportedAddress.trim()
+      ? input.reportedAddress.trim()
+      : null;
+  const localWallet = input.localWallet ?? null;
+
+  if (!localWallet) {
+    if (!reportedAddress) {
+      return {
+        status: "missing",
+        owned: false,
+        stale: false,
+        reportedAddress: null,
+        localOwnedAddress: null,
+        summary: "No sponsored wallet is configured in the local keystore.",
+        guidance: ["Run mindvault_setup_wallet to create and persist a new wallet."],
+      };
+    }
+    return {
+      status: "stale_unowned",
+      owned: false,
+      stale: true,
+      reportedAddress,
+      localOwnedAddress: null,
+      summary: `Reported sponsored address ${reportedAddress} is not owned by the local keystore (no wallet persisted).`,
+      guidance: [
+        "Creation likely timed out or failed after funding and before local persistence; this address is stale and NOT spendable by this agent.",
+        "Do not treat this address as an active wallet. Run mindvault_setup_wallet to create a new wallet, or mindvault_import_wallet only if you already hold the matching secret key.",
+      ],
+    };
+  }
+
+  const integrity = checkWalletIntegrity(localWallet, input.derivePublicKey);
+  const storedAddress =
+    typeof localWallet.publicKey === "string" && localWallet.publicKey.trim()
+      ? localWallet.publicKey.trim()
+      : null;
+
+  if (!integrity.ok) {
+    const effectiveReported = reportedAddress ?? storedAddress;
+    let localOwnedAddress: string | null = null;
+    if (integrity.code === "address_mismatch" && typeof localWallet.secretKey === "string") {
+      try {
+        localOwnedAddress = input.derivePublicKey(localWallet.secretKey.trim());
+      } catch {
+        localOwnedAddress = null;
+      }
+    }
+    return {
+      status: "stale_unowned",
+      owned: false,
+      stale: true,
+      reportedAddress: effectiveReported,
+      localOwnedAddress,
+      integrityCode: integrity.code,
+      summary: `Local keystore does not own ${effectiveReported ?? "the configured sponsored wallet"} (${integrity.message}).`,
+      guidance: [
+        "Any balance shown for this address is NOT spendable by this agent: payments will fail at signing.",
+        "Run mindvault_import_wallet with the matching secret key, or mindvault_setup_wallet to create a new wallet.",
+      ],
+    };
+  }
+
+  const localOwnedAddress = integrity.publicKey;
+  if (reportedAddress && reportedAddress !== localOwnedAddress) {
+    return {
+      status: "stale_unowned",
+      owned: false,
+      stale: true,
+      reportedAddress,
+      localOwnedAddress,
+      integrityCode: "address_mismatch",
+      summary: `Reported sponsored address ${reportedAddress} does not match the local keystore wallet (${localOwnedAddress}).`,
+      guidance: [
+        "A half-completed creation may have funded a different account whose secret key was never persisted locally.",
+        "Do not treat the reported address as spendable; use the local keystore address or run mindvault_setup_wallet to replace it.",
+      ],
+    };
+  }
+
+  return {
+    status: "owned",
+    owned: true,
+    stale: false,
+    reportedAddress: localOwnedAddress,
+    localOwnedAddress,
+    summary: `Local keystore owns sponsored wallet ${localOwnedAddress}.`,
+    guidance: [],
+  };
+}
+
+/** Render a deterministic, secret-free summary of a sponsored-wallet diagnostic. */
+export function formatSponsoredWalletDiagnostic(diagnostic: SponsoredWalletDiagnostic): string {
+  const header = [
+    `Wallet status: ${diagnostic.status}`,
+    `Owned: ${diagnostic.owned ? "yes" : "no"}`,
+    `Stale: ${diagnostic.stale ? "yes" : "no"}`,
+    diagnostic.reportedAddress ? `Reported: ${diagnostic.reportedAddress}` : null,
+    diagnostic.localOwnedAddress ? `Keystore: ${diagnostic.localOwnedAddress}` : null,
+    diagnostic.integrityCode ? `Code: ${diagnostic.integrityCode}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return [header, diagnostic.summary, ...diagnostic.guidance].join("\n");
 }

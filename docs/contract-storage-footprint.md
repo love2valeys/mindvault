@@ -95,14 +95,22 @@ shared bounded view and is not included in the per-registration aggregate.
   measured at this fixture's cardinality (two resources for the creator, one
   resource per tag); read them as a per-member baseline. Each additional member
   adds roughly one id's worth of bytes.
-- **Instance entries** (`Count`, `CreatorCount`, `FeeConfig`, `FeeDestination`, `Admin`, and the
-  three role grants) share the contract's instance TTL, so they are bumped
-  together and never archive independently. They are all small; `CreatorCount`
-  is the only one that grows with the number of distinct creators.
+- **Instance entries** (`Count`, `CreatorCount`, `FeeConfig`, `FeeDestination`, `Admin`, the
+  three role grants, and `RoleIndexKey::Members`) share the contract's instance
+  TTL, so they are bumped together and never archive independently. They are
+  all small; `CreatorCount` is the only one that grows with the number of
+  distinct creators.
 - **`FlagModerator`** holds a single `Address`: the moderator whose
   `flag_resource`, `unflag_resource`, or `set_flag_reason_hash` came last,
   read back by `flag_details`. It is one entry per moderated resource and is
-  overwritten in place, so it never grows.
+  overwritten in place, so it never grows. Moderator writes also refresh any
+  attached `FlagReasonHash` entry's TTL so both keys stay synchronized.
+- **`MetadataPointers`** holds a bounded `MetadataPointers { pointers, primary }`
+  mirror set (1–`MAX_METADATA_POINTERS` = 4 unique pointers, each at most 512
+  bytes) written by `set_metadata_pointers` and cleared by `update_metadata`
+  when the primary changes. Its TTL is bumped on `set_metadata_pointers`,
+  `get_metadata_pointers`, `extend_resource_ttl`, and any resource update saved
+  via `save`.
 - **`DataKey::DisputeFlag` is never written.** The dispute flag lives on the
   `Resource` struct (see `flag_resource`), so the key exists in the `DataKey`
   enum without a corresponding entry.
@@ -119,6 +127,29 @@ shared bounded view and is not included in the per-registration aggregate.
 - **`AttestationReasonHash`** records the public reason hash (up to 64 bytes)
   stored when an attestation is revoked via `revoke_attestation`. It occupies a
   single persistent entry per resource (~68 byte key, ~72 byte value, ~140 bytes total).
+
+## TTL write inventory
+
+Every mutation below refreshes the entry it writes with `bump_persistent`, or
+refreshes the shared instance entry with `bump_instance`. These are TTL
+lifetimes, not a promise that an expired entry can be read without restoration.
+
+| Mutation                                 | Storage keys                                                                                                                      | TTL bump                                                          |
+| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Role grant, revoke, or rotation          | `Verifier`, `Moderator`, `Settler`, and role member lists                                                                         | Shared instance TTL; role lists bump on each actual list mutation |
+| Resource registration and catalog repair | `Resource`, `Index`, `CreatorResources`; `Count` and creator/listed counts                                                        | Each persistent key; shared instance for counters                 |
+| Metadata mirrors and resource TTL extend | `MetadataPointers`, `Resource`                                                                                                    | Both persistent keys refreshed together                           |
+| Moderation flag or reason hash update    | `Resource`, `FlagModerator`, `FlagReasonHash`                                                                                     | Each written/attached persistent key                              |
+| Tag add, remove, or repair               | `TagIndex`; `TagCount`, `TopTags`                                                                                                 | Each persistent index key; shared instance for popularity         |
+| Payment record and settlement            | `PaymentReceipt`, `PaymentRecipient`, `PaymentIndex`, `PaymentTxHash`, `BuyerPayments`, `BuyerResourcePayments`, `RefundDeadline` | Each written persistent key                                       |
+| Fee configuration or destination update  | `FeeConfig`, `FeeDestination`                                                                                                     | Shared instance TTL                                               |
+| Refund record                            | `RefundReceipt`, `RefundedAmount`, `RefundTxHash`                                                                                 | Each written persistent key                                       |
+| Lease create, renew, settle, or revoke   | `Lease(resource_id, holder)`                                                                                                      | Lease persistent key                                              |
+
+The regression coverage in `src/test/storage_ttl_mutations.rs` checks these
+families after the ledger TTL has crossed the extension threshold. Other
+write paths use the same helpers; when adding a new storage key, pair its
+mutation with the appropriate helper in the same code path.
 
 ## Changing the numbers
 

@@ -11,15 +11,20 @@ restart. Secret keys are never shown in tool output.
 
 ## Tools
 
-| Tool                      | What it does                                                                                                                                                                              |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `mindvault_setup_wallet`  | Create a wallet. Optional `profile` arg creates/switches to that named profile before creating it.                                                                                        |
-| `mindvault_use_profile`   | Switch the active profile (`name` required), creating it if it does not exist.                                                                                                            |
-| `mindvault_list_profiles` | List all profiles, marking the active one and showing each wallet address and registration state.                                                                                         |
-| `mindvault_wallet_info`   | Show the active profile name, wallet address, USDC balance, and whether it is registered.                                                                                                 |
-| `mindvault_reset`         | Clear the active profile's credentials, or pass `all=true` to remove every profile and delete state. Requires `confirm=true` — see [Reset confirmation guard](#reset-confirmation-guard). |
-| `mindvault_backup_state`  | Export an encrypted backup of `~/.mindvault/state.json` (passphrase min 8 chars). No plaintext secrets in the blob.                                                                       |
-| `mindvault_restore_state` | Restore state from a `mindvault_backup_state` blob. Integrity-checked before any write.                                                                                                   |
+| Tool                                | What it does                                                                                                                                                                              |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mindvault_setup_wallet`            | Create a wallet. Optional `profile` arg creates/switches to that named profile before creating it.                                                                                        |
+| `mindvault_use_profile`             | Switch the active profile (`name` required), creating it if it does not exist.                                                                                                            |
+| `mindvault_list_profiles`           | List all profiles, marking the active one and showing each wallet address and registration state.                                                                                         |
+| `mindvault_wallet_info`             | Show the active profile name, wallet address, USDC balance, and whether it is registered.                                                                                                 |
+| `mindvault_wallet_balances`         | Show wallet balances with the active profile's estimated pending spend and configured automatic USDC payment ceiling.                                                                     |
+| `mindvault_reset`                   | Clear the active profile's credentials, or pass `all=true` to remove every profile and delete state. Requires `confirm=true` — see [Reset confirmation guard](#reset-confirmation-guard). |
+| `mindvault_backup_state`            | Export an encrypted backup of `~/.mindvault/state.json` (passphrase min 8 chars). No plaintext secrets in the blob.                                                                       |
+| `mindvault_restore_state`           | Restore state from a `mindvault_backup_state` blob. Integrity-checked before any write.                                                                                                   |
+| `mindvault_preview_state_migration` | Preview a pending legacy state migration without writing; reports changed field paths and the planned private backup.                                                                     |
+| `mindvault_apply_state_migration`   | Apply a pending migration after confirmation, creating a mode-0600 recovery copy first.                                                                                                   |
+| `mindvault_export_state_selective`  | Export versioned profile names and network preferences without wallet or publisher credentials.                                                                                           |
+| `mindvault_import_state_selective`  | Import selective profile preferences without replacing existing wallet or publisher credentials.                                                                                          |
 
 ## Moving environments (backup / restore)
 
@@ -44,6 +49,38 @@ mindvault_restore_state {
 
 Unit coverage: [`mcp/src/stateBackup.test.ts`](../mcp/src/stateBackup.test.ts).
 
+## Selective profile sharing
+
+Use selective export when setting up profile names and network preferences on
+another machine without sharing credentials:
+
+```text
+mindvault_export_state_selective
+# → {"version":1,"activeProfile":"publisher","profiles":{"publisher":{"network":"testnet"}}}
+
+mindvault_import_state_selective { "blob": "<the JSON above>" }
+```
+
+The stable `version: 1` schema contains only profile names, the active profile,
+and optional `testnet`/`mainnet` preferences. Wallet public keys, private keys,
+seed phrases, and publisher API keys are excluded. Import merges those
+preferences and never overwrites wallet or publisher credentials already on
+the destination.
+
+## Previewing legacy state migration
+
+Legacy single-wallet state remains available in memory until a write or an
+explicit apply. Preview its v1 profile conversion first; the apply operation
+creates a mode-0600 backup of the original bytes before atomically replacing the
+state file. A failed atomic replacement leaves the original file intact.
+
+```text
+mindvault_preview_state_migration
+mindvault_apply_state_migration {}
+# → preview only; state is unchanged
+mindvault_apply_state_migration { "confirm": true }
+```
+
 ## Wallet integrity
 
 A profile's wallet is only usable if the secret key it stores derives the address
@@ -56,9 +93,23 @@ it stores. That is checked at both boundaries where a keypair can enter:
 - `mindvault_wallet_info` re-checks the stored keypair and adds a `⚠ Keystore:`
   line — and `ownsAddress: false` in its structured output — when they disagree,
   so a balance for an unsignable address never reads as spendable funds.
+- `mindvault_wallet_balances` runs the same ownership check per profile, flags
+  any stale/unowned address in its row note, and excludes unowned addresses from
+  spendable totals and `spendSummary.currentBalanceUsdc`.
 
-`mindvault_import_wallet` derives the address from the secret it is given, so an
-imported wallet is consistent by construction.
+`mindvault_import_wallet` first verifies a key and reports its derived address,
+profile, and configured network without writing. Persist it only in a second call
+with `persist: true`, the same `profile` and `network`, and
+`confirmAddress` equal to the displayed address. The selected network must match
+the configured Stellar network. Secret parsing errors never include SDK error
+text, and the secret is never returned.
+
+`mindvault_wallet_balances` reports an estimated pending spend for the active
+profile using current public resource prices for pending idempotent purchases.
+The estimate is labeled and returns `null` if any pending attempt cannot be
+priced or the lookup cap is exceeded; it does not understate unknown amounts.
+The summary also identifies the Stellar network, USDC balance, and configured
+automatic payment ceiling. It performs reads only and never signs or transfers.
 
 ## Reset confirmation guard
 

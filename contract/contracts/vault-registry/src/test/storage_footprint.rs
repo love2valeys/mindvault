@@ -366,10 +366,14 @@ fn storage_footprint_report() {
         .filter(|r| matches!(r.label, "PaymentReceipt" | "PaymentIndex -> receipt id"))
         .map(FootprintRow::total)
         .sum();
+    const PER_RESOURCE_BUDGET: usize = 1_900;
+    const PER_PAYMENT_BUDGET: usize = 850;
     std::println!(
-        "\nPer max-size registration (Resource + Index + one TagIndex + one TagCount): {per_resource} bytes"
+        "\nPer max-size registration (Resource + Index + one TagIndex + one TagCount): {per_resource} bytes (budget: {PER_RESOURCE_BUDGET} bytes)"
     );
-    std::println!("Per payment (PaymentReceipt + PaymentIndex): {per_payment} bytes\n");
+    std::println!(
+        "Per payment (PaymentReceipt + PaymentIndex): {per_payment} bytes (budget: {PER_PAYMENT_BUDGET} bytes)\n"
+    );
 
     for row in &rows {
         assert!(
@@ -384,13 +388,13 @@ fn storage_footprint_report() {
     }
 
     assert!(
-        per_resource <= 1_900,
+        per_resource <= PER_RESOURCE_BUDGET,
         "a max-size registration now writes {per_resource} XDR bytes across its \
-         four entry classes, over the 1900-byte budget"
+         four entry classes, over the {PER_RESOURCE_BUDGET}-byte budget"
     );
     assert!(
-        per_payment <= 850,
+        per_payment <= PER_PAYMENT_BUDGET,
         "a payment now writes {per_payment} XDR bytes across its two entry \
-         classes, over the 850-byte budget"
+         classes, over the {PER_PAYMENT_BUDGET}-byte budget"
     );
 }

@@ -79,6 +79,13 @@ index or manifest that could disagree with what is on disk.
   it, so a restart does not destroy the previous session's trail.
 - The minimum accepted size is 1 KiB. A smaller value falls back to the
   default, because rotating on every line would produce thousands of files.
+- **Serialized rotation and read locks:** appends and rotations are serialized
+  through the writer's mutex and respect active read locks (used by
+  `collectAuditTail` for debug and support bundles). If rotation crosses an
+  active read lock or in-flight append, operations are buffered in FIFO order
+  instead of truncating or renaming mid-read; once the lock releases, all
+  pre-rotation tail entries are flushed and `fsync`ed into the live file before
+  it is renamed to `.1`.
 
 ## Failure handling
 

@@ -81,9 +81,37 @@ export type PublishStatusResponse = {
   data: any;
 };
 
+/**
+ * Normalize a verification status string from the backend.
+ *
+ * Known statuses (`pending`, `verified`, `rejected`, `skipped`) are trimmed
+ * and lowercased so mixed-case replies such as `"Rejected"` are still
+ * recognized as terminal states. Unknown non-empty strings are returned
+ * trimmed; non-string or blank values return `null`.
+ */
+export function normalizeVerificationStatus(status: unknown): string | null {
+  if (typeof status !== "string") return null;
+  const trimmed = status.trim();
+  if (!trimmed) return null;
+  const lowered = trimmed.toLowerCase();
+  if ((VERIFICATION_STATUSES as readonly string[]).includes(lowered)) {
+    return lowered;
+  }
+  return trimmed;
+}
+
 export function isVerificationSettled(status: string | null | undefined): boolean {
-  if (!status) return false;
-  return SETTLED_VERIFICATION.has(status as VerificationStatus);
+  const normalized = normalizeVerificationStatus(status);
+  if (!normalized) return false;
+  return SETTLED_VERIFICATION.has(normalized as VerificationStatus);
+}
+
+function isAbortError(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { name?: unknown }).name === "AbortError"
+  );
 }
 
 function resourceNotFound(resourceId: string): Error {
@@ -101,7 +129,7 @@ function resourceNotFound(resourceId: string): Error {
  * status never goes back to pending, so that poll has settled: throwing there
  * discarded a `rejected` the server had already returned and ended a
  * `wait: true` call in an error instead of stopping at the terminal state
- * (#840).
+ * (#840, #217).
  */
 export function publishStatusFromResponses(
   resourceId: string,
@@ -134,9 +162,65 @@ export function publishStatusFromResponses(
   return { meta, verification };
 }
 
-/** The verification status a fetched snapshot reports, defaulting to pending. */
+/**
+ * Fetch `/meta` and `/verification` sequentially and combine them into one
+ * poll snapshot.
+ *
+ * If one endpoint throws a transport or timeout error after `jsonFetch`
+ * exhausts its retries while the companion endpoint already reports a terminal
+ * verification status (`verified`, `rejected`, or `skipped`), the terminal
+ * snapshot is preserved so `wait: true` stops immediately instead of
+ * discarding a known rejection or continuing to poll (#217). Caller-initiated
+ * aborts (`AbortError`) always propagate immediately.
+ */
+export async function fetchPublishStatusPair(
+  resourceId: string,
+  fetchMeta: () => Promise<PublishStatusResponse>,
+  fetchVerification: () => Promise<PublishStatusResponse>,
+): Promise<PublishStatusFetch> {
+  let metaRes: PublishStatusResponse | null = null;
+  let metaErr: unknown = null;
+  try {
+    metaRes = await fetchMeta();
+  } catch (err) {
+    if (isAbortError(err)) throw err;
+    metaErr = err;
+  }
+
+  let verRes: PublishStatusResponse | null = null;
+  let verErr: unknown = null;
+  try {
+    verRes = await fetchVerification();
+  } catch (err) {
+    if (isAbortError(err)) throw err;
+    verErr = err;
+  }
+
+  if (metaRes && verRes) {
+    return publishStatusFromResponses(resourceId, metaRes, verRes);
+  }
+  if (metaRes?.ok && isVerificationSettled(metaRes.data?.verificationStatus)) {
+    return { meta: metaRes.data, verification: null };
+  }
+  if (verRes?.ok && isVerificationSettled(verRes.data?.status)) {
+    return { meta: null, verification: verRes.data };
+  }
+  throw metaErr ?? verErr;
+}
+
+/**
+ * The verification status a fetched snapshot reports, defaulting to pending.
+ *
+ * Terminal statuses take precedence over non-terminal ones across the two
+ * endpoints so a stale `pending` on `/verification` cannot override a
+ * `rejected` (or `verified`/`skipped`) already reported on `/meta` (#217).
+ */
 export function currentVerificationStatus(data: PublishStatusFetch): string {
-  return data.verification?.status ?? data.meta?.verificationStatus ?? "pending";
+  const verStatus = normalizeVerificationStatus(data.verification?.status);
+  const metaStatus = normalizeVerificationStatus(data.meta?.verificationStatus);
+  if (isVerificationSettled(verStatus)) return verStatus!;
+  if (isVerificationSettled(metaStatus)) return metaStatus!;
+  return verStatus ?? metaStatus ?? "pending";
 }
 
 export function normalizeTimeoutMs(raw: unknown): number {
@@ -182,7 +266,7 @@ export function buildPublishStatusSnapshot(
 ): PublishStatusSnapshot {
   const meta = data.meta;
   const ver = data.verification;
-  const verificationStatus = ver?.status ?? meta?.verificationStatus ?? "pending";
+  const verificationStatus = currentVerificationStatus(data);
   const settled = isVerificationSettled(verificationStatus);
   const onchainStatus = meta?.onchainStatus ?? null;
   const onchainTxHash = meta?.onchainTxHash ?? null;
@@ -327,10 +411,10 @@ export async function pollPublishStatus(
   let data = await opts.fetchStatus(opts.resourceId);
   attempts += 1;
   let status = currentVerificationStatus(data);
-  await report(status, isVerificationSettled(status));
+  let settled = isVerificationSettled(status);
+  await report(status, settled);
 
-  while (opts.wait) {
-    if (isVerificationSettled(status)) break;
+  while (opts.wait && !settled) {
     if (now() >= deadline) {
       timedOut = true;
       await report(status, false);
@@ -340,7 +424,7 @@ export async function pollPublishStatus(
     data = await opts.fetchStatus(opts.resourceId);
     attempts += 1;
     status = currentVerificationStatus(data);
-    const settled = isVerificationSettled(status);
+    settled = isVerificationSettled(status);
     if (!settled && now() >= deadline) timedOut = true;
     await report(status, settled);
     if (settled || timedOut) break;

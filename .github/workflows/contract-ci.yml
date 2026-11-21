@@ -170,6 +170,9 @@ jobs:
         working-directory: contract/contracts/vault-registry
         run: make footprint
 
+      - name: Verify storage footprint report
+        run: node scripts/refresh-storage-footprint.mjs --check
+
   no-std-check:
     name: Check no_std Compatibility
     runs-on: ubuntu-latest

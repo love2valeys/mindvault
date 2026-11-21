@@ -232,6 +232,24 @@ Successful buys also append a local receipt under `~/.mindvault/purchases.json` 
 
 ---
 
+### 11b. `mindvault_verify_attestation`
+
+Verifies that the content received after purchase matches the verifier's on-chain attestation hash. AI agents can use this content integrity check before consuming or executing downloaded digital resources.
+
+**Input:**
+
+```json
+{
+  "resourceId": "cm7x8y9z",
+  "attestationHash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+}
+```
+
+**Output:**
+Returns a structured verification report with `verified: true/false`, `matches: true/false`, `registeredAttestationHash`, and an actionable `summary`.
+
+---
+
 ### 12. `mindvault_purchase_history`
 
 Read-only list of locally persisted purchase receipts. Optional filters:
@@ -313,11 +331,24 @@ Updates the on-chain price in USDC for a registered resource in the vault-regist
 ### 16. `mindvault_transfer_ownership`
 
 Transfers ownership of a registered resource on the vault-registry contract to a new creator address.
+Optionally include `newTermsHash` to bind a terms hash to the incoming owner and/or
+`resetAttestation: true` to clear the resource's attestation hash. These actions
+are atomic with the ownership transfer when the deployed contract supports the
+terms-aware transfer method; calls without these fields retain the legacy transfer path.
 
 **Input:**
 
 ```json
 { "resourceId": "abc123", "newCreator": "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH" }
+```
+
+```json
+{
+  "resourceId": "abc123",
+  "newCreator": "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH",
+  "newTermsHash": "sha256:0123456789abcdef",
+  "resetAttestation": true
+}
 ```
 
 ---
@@ -330,6 +361,40 @@ Manages catalog availability by listing or delisting a resource on-chain.
 
 ```json
 { "resourceId": "abc123", "listed": false }
+```
+
+---
+
+### 18. `mindvault_terms`
+
+Gets or sets the creator's on-chain licensing terms hash on the vault-registry contract. Publishers use `set` to bind licensing terms to their identity, and agents or consumers use `get` to inspect terms before interacting or purchasing.
+
+**Input (Set):**
+
+```json
+{
+  "operation": "set",
+  "termsHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}
+```
+
+**Input (Get):**
+
+```json
+{
+  "operation": "get",
+  "creator": "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH"
+}
+```
+
+**Example output (Get):**
+
+```json
+{
+  "creator": "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH",
+  "termsHash": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "found": true
+}
 ```
 
 ---

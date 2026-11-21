@@ -53,6 +53,7 @@ describe("MCP integration harness", () => {
     expect(names).toContain("mindvault_search");
     expect(names).toContain("mindvault_preview");
     expect(names).toContain("mindvault_registry_info");
+    expect(names).toContain("mindvault_contract_preflight");
     expect(names).toContain("mindvault_registry_lookup");
     expect(names).toContain("mindvault_registry_list");
     expect(names).toContain("mindvault_registry_count");

@@ -1,4 +1,4 @@
-# MindVault Contracts (Soroban)
+﻿# MindVault Contracts (Soroban)
 
 Soroban smart contracts for MindVault. Today there is one:
 
@@ -224,11 +224,12 @@ its transaction evidence separately.
 - `royalty_bps ≤ MAX_FEE_BPS` (else `FeeBpsTooHigh`)
 - `platform_fee_bps + royalty_bps ≤ MAX_FEE_BPS` (else `TotalFeeTooHigh`)
 
-`validate_price` (called on every `register` / `set_price` / `set_price_many`) enforces:
+`validate_price` (called on every `register`, `register_with_hash`, `register_with_memo`, `register_batch` item, `set_price`, and `set_price_many` item) enforces the explicit reserve-price / minimum-royalty floor:
 
-- `price > platform_fee_bps + royalty_bps` (else `InvalidPrice`)
+- `price >= minimum_price_floor` where `minimum_price_floor = platform_fee_bps + royalty_bps + 1` (equivalently `price > platform_fee_bps + royalty_bps`, which also enforces `price > royalty_bps`), else `InvalidPrice`
+- When no `FeeConfig` is stored (or both rates are `0`), the floor defaults to `1` USDC base unit.
 
-This two-layer invariant — a fee ceiling in `set_fee_config` and a price floor in `validate_price` — guarantees the creator always receives a **positive** remainder of at least `MIN_CREATOR_SHARE_BPS` (50 %) on every sale.
+This two-layer invariant — a fee ceiling in `set_fee_config` and a semantic reserve-price / minimum-royalty floor in `validate_price` — prevents tiny prices from generating negative or zero-remainder splits and guarantees the creator always receives a **positive** remainder of at least `MIN_CREATOR_SHARE_BPS` (50 %) on every sale.
 The contract does **not** collect fees itself — it stores the agreed split so
 off-chain settlement (x402 facilitator, future settlement contracts) can read
 and apply it.
@@ -251,6 +252,8 @@ See [`docs/adr-fee-config.md`](../docs/adr-fee-config.md) for the full design ra
 | `get_metadata_pointers(id)` | — | `id: String` | `Result<MetadataPointers, Error>` | All metadata pointers plus the primary index; falls back to `[metadata]` with primary `0`. |
 | `set_tags(id, tags)`                                                         | `creator`                                                | `id: String`; `tags: Vec<String>` — max 8 tags, each max 32 bytes                                                                                                                                                                                    | `Result<(), Error>`                    | Replace discovery tags. Does not touch `metadata`. Emits `settags` with the previous and next tag lists.                                                                                                                                                                                                 |
 | `set_royalty_recipient(id, recipient)`                                       | `creator`                                                | `id: String`; `recipient: Option<Address>`                                                                                                                                                                                                           | `Result<(), Error>`                    | Set or clear a per-resource royalty recipient override. Emits `setroyal` with the old and new recipient.                                                                                                                                                                                                |
+| `set_royalties_disabled(id, disabled)`                                      | `creator`                                                | `id: String`; `disabled: bool`                                                                                                                                                                                                                       | `Result<(), Error>`                    | Enable or disable future royalty routing for the resource. Older resources default to false; emits `setroyoff` with old and new values.                                                                                                                                                                  |
+| `royalties_disabled(id)`                                                    | —                                                        | `id: String`                                                                                                                                                                                                                                         | `Result<bool, Error>`                  | Read the resource's royalty opt-out flag. Errors `NotFound` for an unknown resource.                                                                                                                                                                                                                     |
 | `transfer_ownership(id, new_creator)`                                        | `creator`                                                | `id: String`; `new_creator: Address`                                                                                                                                                                                                                 | `Result<(), Error>`                    | Transfer resource ownership immediately. Errors `AlreadyOwner` if `new_creator` already owns it. Clears any pending `propose_transfer` for the resource.                                                                                                                                                 |
 | `transfer_ownership_with_terms(id, new_creator, new_terms_hash, reset_attestation)` | `creator`                                       | `id: String`; `new_creator: Address`; `new_terms_hash: Option<String>` — max 64 bytes; `reset_attestation: bool`                                                                                                                                     | `Result<(), Error>`                    | Transfer ownership while optionally binding a new terms hash to the incoming owner and/or clearing the resource's attestation record atomically. Emits `transfer` and `txfrterms`. Errors `AlreadyOwner`, `TermsHashTooLong`, or `ResourceNotMutable`.                                                   |
 | `propose_transfer(id, new_creator)`                                          | `creator`                                                | `id: String`; `new_creator: Address`                                                                                                                                                                                                                 | `Result<(), Error>`                    | Propose a two-step transfer; takes effect only once `new_creator` calls `accept_transfer`.                                                                                                                                                                                                               |
@@ -274,8 +277,8 @@ See [`docs/adr-fee-config.md`](../docs/adr-fee-config.md) for the full design ra
 | `list_by_tag_page(tag, cursor, limit)`                                       | —                                                        | `tag: String` (normalized to lowercase); `cursor: u32`; `limit: u32` — capped at `LIST_PAGE_CAP` (20)                                                                                                                                               | `CatalogPage`                          | Paginated list of resources carrying `tag` with `items` and `next_cursor`.                                                                                                                                                                                                                               |
 | `list_by_dispute_status(flagged, start, limit)`                              | —                                                        | `flagged: bool`; `start: u32`; `limit: u32` — capped at `LIST_PAGE_CAP` (20)                                                                                                                                                                         | `Vec<Resource>`                        | Paginated list of resources filtered by whether `dispute_flag` is active, preserving catalog order. Each resource entry read has its TTL bumped.                                                                                                                                                         |
 | `list_by_dispute_status_page(flagged, cursor, limit)`                       | —                                                        | `flagged: bool`; `cursor: u32`; `limit: u32` — capped at `LIST_PAGE_CAP` (20)                                                                                                                                                                        | `CatalogPage`                          | Paginated list of resources filtered by whether `dispute_flag` is active with `items` and `next_cursor`.                                                                                                                                                                                                  |
-| `list_by_verification_status(status, start, limit)`                          | —                                                        | `status: VerificationStatus`; `start: u32`; `limit: u32` — capped at `LIST_PAGE_CAP` (20)                                                                                                                                                           | `Vec<Resource>`                        | Paginated list of resources filtered by verification `status` (pending/verified/rejected), preserving catalog order. Each resource entry read has its TTL bumped.                                                                                                                                        |
-| `top_tags(limit)`                                                            | —                                                        | `limit: u32` — capped at `TOP_TAGS_CAP` (20)                                                                                                                                                                                                        | `Vec<TagPopularity>`                   | Return the most popular tags sorted by descending use-count, capped at `limit`. Each entry is a `TagPopularity { tag, count }`. Returns an empty vec when no tags have been assigned.                                                                                                                    |
+| `list_by_verification_status(status, cursor, limit)`                         | —                                                        | `status: VerificationStatus`; `cursor: u32`; `limit: u32` — capped at `LIST_PAGE_CAP` (20)                                                                                                                                                          | `CatalogPage`                          | Paginated catalog page filtered by verification `status` (`Pending`, `Verified`, `Rejected`, or `Revoked`), preserving catalog order and returning `items` + `next_cursor`. Each scanned index and resource entry has its TTL bumped.                                                                |
+| `top_tags(limit)`                                                            | —                                                        | `limit: u32` — capped at `TOP_TAGS_CAP` (20)                                                                                                                                                                                                        | `Vec<TagPopularity>`                   | Return up to `limit` tags ordered by descending successful-registration count, then lexicographically for ties. Each entry is `TagPopularity { tag, count }`; counters saturate at `u32::MAX` and are unchanged by `set_tags` or tombstoning.                                                           |
 | `list_by_state(state, cursor, limit)`                                        | —                                                        | `state: ResourceState` — one of `Listed`, `Delisted`, `Frozen`, `Disputed`, `Tombstoned`; `cursor: u32`; `limit: u32` — capped at `LIST_PAGE_CAP` (20)                                                                                              | `CatalogPage`                          | Paginated list of resources whose lifecycle state exactly matches `state`, preserving catalog order. Unlike the boolean `listed` projection, this distinguishes all five states. Returns a `CatalogPage` with `items` and `next_cursor`. Each resource entry read has its TTL bumped.                    |
 | `get(id)`                                                                    | —                                                        | `id: String`                                                                                                                                                                                                                                         | `Result<Resource, Error>`              | Read a single resource. Errors `NotFound` if absent.                                                                                                                                                                                                                                                     |
 | `get_resource_state(id)`                                                     | —                                                        | `id: String`                                                                                                                                                                                                                                         | `Result<ResourceState, Error>`              | Read the current lifecycle state of a resource. Errors `NotFound` if absent.                                                                                                                                                                                                                                   |
@@ -338,7 +341,10 @@ See [`docs/adr-fee-config.md`](../docs/adr-fee-config.md) for the full design ra
 | `set_fee_recipient(recipient)`                                                | `admin`                                                  | `recipient: Option<Address>`                                                                                                                                                                                                                        | `Result<(), Error>`                    | Update only the configured fee recipient while preserving existing fee rates. Errors `FeeConfigNotSet` if no config exists. Emits `setfee`.                                                                                                                                                              |
 | `set_fee_destination(config)`                                                | `admin`                                                  | `config: FeeDestinationConfig` — `bps` share of the platform fee (0–10 000) and `destination` (`None`, `Burn`, or `Charity(address)`)                                                                                                                       | `Result<(), Error>`                    | Set or clear the burn/charity route without changing the base fee config. Emits `setdest`; the event records policy, not token movement.                                                                                                                                                         |
 | `get_fee_destination()`                                                      | —                                                        | —                                                                                                                                                                                                                                                    | `FeeDestinationConfig`                 | Fetch the current fee-destination policy, defaulting to `None` with zero bps.                                                                                                                                                                                                                              |
+| `preview_fee_split(amount)`                                                  | —                                                        | `amount: i128` — proposed sale amount / price in USDC stroops                                                                                                                                                                                        | `Result<FeeSplitPreview, Error>`       | Calculate exact integer platform, destination, recipient, royalty fees, and creator remainder for a price before payment recording. Validates amount bounds.                                                                                                               |
+| `preview_fee_split_for_resource(resource_id, amount)`                       | —                                                        | `resource_id: String`; `amount: i128`                                                                                                                                                                                                                 | `Result<FeeSplitPreview, Error>`        | Preview the same fee split using the resource's royalty opt-out flag; platform and destination fees are unchanged.                                                                                                                                                                                       |
 | `repair_index(ids)`                                                          | `admin`                                                  | `ids: Vec<String>` — authoritative ordered id list                                                                                                                                                                                                   | `Result<(), Error>`                    | Rebuild the pagination index and `Count` from an admin-supplied id list. Rejects duplicates with `DuplicateInRepair`. Emits `reindex`.                                                                                                                                                                   |
+| `repair_index_chunk(ids, cursor)`                                            | `admin`                                                  | `ids: Vec<String>` — next slice of the authoritative list, ≤ `REPAIR_INDEX_CHUNK_CAP` (50); `cursor: u32` — catalog position to write at, ≤ current `Count`                                                                                          | `Result<u32, Error>`                   | Bounded, resumable rebuild for large registries: writes `ids` into `Index(cursor..)` and sets `Count` to `cursor + ids.len()`, returning the cursor for the next call. Interrupted repairs resume from the last returned cursor. Errors `BatchTooLarge` above the cap, `InvalidRepairCursor` past `Count`, `NotFound`, `DuplicateInRepair`. Emits `reindex` per chunk. |
 | `repair_tag_index(ids)`                                                      | `admin`                                                  | `ids: Vec<String>` — authoritative ordered id list                                                                                                                                                                                                   | `Result<(), Error>`                    | Rebuild tag indexes from registered resources. Emits `retagidx`.                                                                                                                                                                                                                                         |
 | `record_payment(settler, receipt_id, resource_id, payer, amount, tx_hash)`   | `settler` + `payer`                                      | `settler: Address` — holder of the settler role; `receipt_id: String` — unique, 1-64 bytes; `resource_id: String`; `payer: Address`; `amount: i128` — `> 0`; `tx_hash: String` — 1-128 bytes                                                         | `Result<(), Error>`                    | Record an x402/Soroban payment receipt in `Escrowed` state and index it under `(resource_id, payer)`. Emits `payment` and a `nomemo` provenance warning — prefer `record_payment_with_memo`.                                                                                                                                                                                   |
 | `record_payment_idempotent(settler, receipt_id, resource_id, payer, amount, tx_hash)` | `settler` + `payer`                                      | Same as `record_payment`; returns existing receipt if identical duplicate already exists.                                                                                                                                                           | `Result<PaymentReceipt, Error>`        | Idempotent payment recording. Returns stored receipt if arguments match existing record, otherwise writes new receipt. Emits `payment` on fresh write.                                                                                                                   |
@@ -356,20 +362,25 @@ See [`docs/adr-fee-config.md`](../docs/adr-fee-config.md) for the full design ra
 | `get_refund(refund_id)`                                                      | —                                                        | `refund_id: String`                                                                                                                                                                                                                                  | `Result<RefundReceipt, Error>`         | Fetch a refund record by its id. Errors `NotFound` if absent.                                                                                                                                                                                                                                              |
 | `get_refunded_amount(payment_receipt_id)`                                    | —                                                        | `payment_receipt_id: String`                                                                                                                                                                                                                         | `Result<i128, Error>`                  | Read the cumulative amount recorded as refunded for a payment. Errors `NotFound` if the payment receipt is absent.                                                                                                                                                                                        |
 | `get_refund_deadline(payment_receipt_id)`                                     | —                                                        | `payment_receipt_id: String`                                                                                                                                                                                                                         | `Result<u32, Error>`                   | Read the exclusive ledger deadline for creator refunds of a settled payment.                                                                                                                                                                                                                              |
+| `get_remaining_refundable(payment_receipt_id)`                                 | —                                                        | `payment_receipt_id: String`                                                                                                                                                                                                                         | `Result<i128, Error>`                  | Read the remaining refundable balance for a settled payment receipt. Errors `NotFound` if the receipt is absent.                                                                                                                                                                                           |
 | `anchor_purchase_receipt(service, resource_id, buyer, receipt_hash)`         | `verifier`                                               | `service: Address`; `resource_id: String`; `buyer: Address`; `receipt_hash: String`                                                                                                                                                                  | `Result<(), Error>`                    | Anchor an immutable purchase receipt hash. Duplicate buyer/resource anchors error `DuplicateReceipt`. Emits `anchor`.                                                                                                                                                                                    |
 | `attempt_anchor_purchase_receipt(service, resource_id, buyer, receipt_hash)` | `verifier`                                               | `service: Address`; `resource_id: String`; `buyer: Address`; `receipt_hash: String`                                                                                                                                                                  | `Result<bool, Error>`                  | Same anchor, but a rejected attempt emits `anchrfail` and returns `false` instead of reverting. Authorization failures still revert.                                                                                                                                                                     |
 | `override_purchase_receipt_anchor(admin, resource_id, buyer, new_receipt_hash)` | `admin`                                                  | `admin: Address`; `resource_id: String`; `buyer: Address`; `new_receipt_hash: String`                                                                                                                                                                | `Result<(), Error>`                    | Override an existing purchase receipt anchor. Errors `NotFound` if it does not exist. Emits `anchor`.                                                                                                                                                                                                  |
 | `get_purchase_receipt(resource_id, buyer)`                                   | —                                                        | `resource_id: String`; `buyer: Address`                                                                                                                                                                                                              | `Result<PurchaseReceiptAnchor, Error>` | Fetch a purchase receipt anchor. Errors `NotFound` if absent.                                                                                                                                                                                                                                            |
 | `get_anchor_attempts(resource_id, buyer)`                                    | —                                                        | `resource_id: String`; `buyer: Address`                                                                                                                                                                                                              | `Result<AnchorAttempts, Error>`        | Rejected `attempt_anchor_purchase_receipt` count and last-attempt ledger for the pair; both `0` when it was never rejected or its anchor has since been written.                                                                                                                                         |
 | `get_anchor_status(resource_id, buyer)` | — | `resource_id: String`; `buyer: Address` | `Result<Option<AnchorStatus>, Error>` | Anchor lifecycle status derived from existing records: `None` (no anchor activity), `Pending` (rejected attempts, retries allowed), `Confirmed` (anchor written) or `Failed` (failure recorded or attempts exhausted). Pre-existing anchors read as `Confirmed`. |
+| `record_anchor_failure(settler, resource_id, buyer, receipt_hash)` | `settler` | `settler: Address`; `resource_id: String`; `buyer: Address`; `receipt_hash: String` | `Result<(), Error>` | Durably record a `VerifierUnavailable` anchor failure for `(resource_id, buyer)` and emit `anchrfail`. Last-write-wins; clears any stale failure record if already anchored. |
+| `get_anchor_failure(resource_id, buyer)` | — | `resource_id: String`; `buyer: Address` | `Result<AnchorFailure, Error>` | Read the outstanding `AnchorFailure` record for `(resource_id, buyer)`. Errors `NotFound` when no unresolved failure exists. |
+| `retry_anchor_purchase_receipt(settler, resource_id, buyer, receipt_hash)` | `settler` | `settler: Address`; `resource_id: String`; `buyer: Address`; `receipt_hash: String` | `Result<bool, Error>` | Settler retry hook requiring `receipt_hash` to match the recorded payment's `tx_hash`. Emits `anchor` and returns `true` on success (or idempotent match); otherwise persists `AnchorFailure`, emits `anchrfail`, and returns `false`. |
 | `buy_lease(holder, resource_id, tier, amount, tx_hash)`                      | `holder`                                                 | `holder: Address`; `resource_id: String`; `tier: LeaseTier` — `Hour`, `Day`, or `Week`; `amount: i128` — must equal `lease_price(resource_id, tier)`; `tx_hash: String` — 1-128 bytes                                                                 | `Result<Lease, Error>`                 | Record a time-limited access lease in `Pending` state, to be confirmed by `settle_lease`. Requires a `Listed` resource (`ResourceNotMutable`), the exact lease price (`PaymentAmountMismatch`), and no pending or unexpired active lease for the pair (`AlreadyRegistered`). Emits `lease`.                |
-| `renew_lease(holder, resource_id, tier, amount, tx_hash)`                    | `holder`                                                 | `holder: Address`; `resource_id: String`; `tier: LeaseTier`; `amount: i128`; `tx_hash: String` — 1-128 bytes                                                                                                                         | `Result<Lease, Error>`                 | Renew an active or unexpired lease without access gaps by extending `expiry_ledger` by tier duration. Emits `leasernw`.                                                                                                                                                   |
+| `renew_lease(holder, resource_id, tier, amount, tx_hash)`                    | `holder`                                                 | `holder: Address`; `resource_id: String`; `tier: LeaseTier`; `amount: i128`; `tx_hash: String` — 1-128 bytes                                                                                                                         | `Result<Lease, Error>`                 | Renew the same holder/resource lease without an access gap. The stored record's resource and holder must match its key; resource ownership transfer does not change the lease binding. Emits `leasernw`.                                                                                   |
 | `record_lease(settler, holder, resource_id, tier, amount, tx_hash)`          | `settler` + `holder`                                     | `settler: Address` — holder of the settler role; then as `buy_lease`                                                                                                                                                                                 | `Result<Lease, Error>`                 | Settler-recorded lease: the same checks as `buy_lease`, written directly in `Active` state because the settler has already confirmed the payment. Emits `lease`.                                                                                                                                         |
 | `settle_lease(settler, resource_id, holder)`                                 | `settler`                                                | `settler: Address`; `resource_id: String`; `holder: Address`                                                                                                                                                                                         | `Result<Lease, Error>`                 | Advance a `Pending` lease to `Active`. Errors `NotFound` without a lease and `InvalidPaymentTransition` if it is not `Pending`. Emits `leasesetl`.                                                                                                                                                        |
 | `revoke_lease(resource_id, holder)`                                          | `creator`                                                | `resource_id: String`; `holder: Address`                                                                                                                                                                                                             | `Result<Lease, Error>`                 | Revoke a `Pending` or `Active` lease; terminal and immediate. Errors `NotFound` without a lease and `InvalidPaymentTransition` if already `Revoked`. Emits `leaserevk`.                                                                                                                                  |
 | `get_lease(resource_id, holder)`                                             | —                                                        | `resource_id: String`; `holder: Address`                                                                                                                                                                                                             | `Result<Lease, Error>`                 | Fetch the lease recorded for the pair, whatever its state. Errors `NotFound` if none exists. Bumps the entry's TTL.                                                                                                                                                                                      |
 | `lease_is_active(resource_id, holder)`                                       | —                                                        | `resource_id: String`; `holder: Address`                                                                                                                                                                                                             | `bool`                                 | `true` while a lease exists for the pair, is `Active`, and the current ledger is below its `expiry_ledger`. Never errors.                                                                                                                                                                                 |
 | `lease_price(resource_id, tier)`                                             | —                                                        | `resource_id: String`; `tier: LeaseTier`                                                                                                                                                                                                             | `Result<i128, Error>`                  | The resource's current price times the tier multiplier (`LEASE_HOUR_MULTIPLIER` 1, `LEASE_DAY_MULTIPLIER` 5, `LEASE_WEEK_MULTIPLIER` 20). Errors `NotFound` for an unknown resource.                                                                                                                     |
+| `list_holder_leases_page(holder, cursor, limit)`                             | —                                                        | `holder: Address`; `cursor: u32` — global resource index; `limit: u32` — scanned entries, capped at 20                                                                                                                                             | `LeasePage`                             | List active, unexpired leases in registration order. Cursor uses the global resource catalog; expired, revoked, and other-holder leases are skipped. A zero limit returns an empty page without advancing the cursor.                                                                                     |
 | `extend_resource_ttl(creator, resource_id)`                                  | `creator`                                                | `creator: Address`; `resource_id: String`                                                                                                                                                                                                            | `Result<(), Error>`                    | Refresh a resource's persistent storage TTL. Emits `ttlext`.                                                                                                                                                                                                                                             |
 | `add_settler(settler)`                                                       | `admin`                                                  | `settler: Address`                                                                                                                                                                                                                                   | `Result<(), Error>`                    | Grant the settler role. Emits `addsettlr`.                                                                                                                                                                                                                                                               |
 | `remove_settler(settler)`                                                    | `admin`                                                  | `settler: Address`                                                                                                                                                                                                                                   | `Result<(), Error>`                    | Revoke the settler role. Emits `rmsettlr`.                                                                                                                                                                                                                                                               |
@@ -411,7 +422,7 @@ transactions rather than contract-held escrow.
 
 Three roles sit alongside the per-resource `creator` and the pre-existing admin:
 
-- **admin** — set via `nominate_new_admin` (see above). Can grant/revoke or rotate the verifier role (`add_verifier`/`remove_verifier`/`rotate_verifier`), repair the pagination index (`repair_index`) or tag index (`repair_tag_index`), set the registry fee config (`set_fee_config`), configure refund windows, and record admin-override refunds. Cannot mutate any resource's price, metadata, listing, tags, or ownership.
+- **admin** — set via `nominate_new_admin` (see above). Can grant/revoke or rotate the verifier role (`add_verifier`/`remove_verifier`/`rotate_verifier`), repair the pagination index (`repair_index`, or `repair_index_chunk` for a bounded resumable rebuild) or tag index (`repair_tag_index`), set the registry fee config (`set_fee_config`), configure refund windows, and record admin-override refunds. Cannot mutate any resource's price, metadata, listing, tags, or ownership.
 - **verifier** — zero or more addresses granted by the admin. Can call `set_verification_status` and `anchor_purchase_receipt`. Cannot touch price, metadata, listing, tags, ownership, or the admin/verifier role list itself.
 
 ### Role management flows
@@ -430,6 +441,7 @@ Caller (new_admin) ──nominate_new_admin(A)──► Admin = A
 - **Auth**: `new_admin` must authorize the call (`require_auth`).
 - **Event**: `setadmin` with `new_admin`.
 - **No accept step** — the caller becomes admin immediately.
+- **Replay protection**: once `DataKey::Admin` is set, the bootstrap branch is permanently closed. Any subsequent `nominate_new_admin` requires the *stored* admin's authorization (an unauthenticated attacker is rejected by Soroban auth), replaying with the current admin fails with `SameAdmin`, and replaying `bootstrap_dual_admin` fails with `AdminAlreadySet` — leaving the stored admin, recovery admin, pending nomination, and all granted verifier/settler/moderator roles unchanged.
 
 #### Admin transfer (two-step rotation)
 
@@ -460,10 +472,14 @@ Admin + Recovery ──bootstrap_dual_admin(A, R)──► Admin = A, RecoveryAd
 Recovery         ──recover_admin(B)────────────► Admin = B (pending nomination cleared)
 ```
 
-- Both keys must authorize the bootstrap and must differ. Only valid before any
+- Both keys must authorize the bootstrap (2-of-2) and must differ (`SameAdmin`). Only valid before any
   admin is set (`AdminAlreadySet`).
+- Role separation stays enforced after bootstrap: `nominate_new_admin` rejects the active
+  `recovery_admin` (`SameAdmin`), and `set_recovery_admin` rejects a live `pending_admin` (`SameAdmin`).
+- `recover_admin` transfers admin authority immediately (even while paused) and clears all pending
+  nomination state (`PendingAdmin`, `PendingAdminExpiry`, `PendingAdminNominatedAt`).
 - The admin can later change or clear the recovery key with
-  `set_recovery_admin`. Emits `setrecov`; recovery emits `recover`.
+  `set_recovery_admin`. Emits `setrecov`; recovery emits `recover` (see `docs/admin-recovery-target-rules.md`).
 
 #### Verifier grant and revoke
 
@@ -541,12 +557,14 @@ Verifier --set_verification_status(id, V, status, attestation_hash)--> Resource.
 
 ### Verifier status query pagination design
 
-The on-chain registry currently exposes `list`, `list_page`, `list_listed`,
-and `list_by_creator` for paginated resource queries. A verifier status filter
-is a natural addition to let agents and indexers efficiently find resources in
-a specific verification state (e.g. all `Pending` resources awaiting review).
+The on-chain registry provides paginated verification reads for both catalog
+filtering (`list_by_verification_status`) and per-verifier audit history
+(`get_verifier_status_history`), plus verifier role membership
+(`list_role_members(RoleKind::Verifier, ...)`). See
+[`docs/verifier-status-pagination-design.md`](../docs/verifier-status-pagination-design.md)
+for the complete specification.
 
-#### Proposed interface
+#### Interface
 
 ```rust
 /// Paginated list of resources whose `verified` field matches `status`.
@@ -558,26 +576,27 @@ pub fn list_by_verification_status(
 ) -> CatalogPage
 ```
 
-- **status**: `Pending`, `Verified`, or `Rejected`.
-- **cursor**: 0-based catalog index (same semantics as `list_page`).
-- **limit**: page size, capped at 20.
+- **status**: `Pending`, `Verified`, `Rejected`, or `Revoked`.
+- **cursor**: 0-based global catalog index (same semantics as `list_page`).
+- **limit**: page size, capped at `LIST_PAGE_CAP` (20).
 - **Returns**: `CatalogPage { items, next_cursor }`.
 
 #### Design rationale
 
-1. **Mirrors existing pagination pattern** — uses the same cursor/limit
-   contract as `list_page` and `list_by_creator`, so clients already know how
-   to paginate.
-2. **No new storage** — the filter is applied at read time by scanning the
-   index. The index already stores all registered resource ids in insertion
-   order; verification status is read from each `Resource` entry. For the
-   current registry size (<10k resources), a linear scan is acceptable.
-3. **If scale demands it** — a secondary index keyed by `(VerificationStatus, u32)`
-   can be introduced later without changing the public API, only the
-   internal implementation. The `CatalogPage` return type stays the same.
-4. **Three-valued filter** — exposing `Pending` is important for verifiers
-   who want a review queue. `Verified` and `Rejected` help auditors and
-   consumers verify the provenance of listed resources.
+1. **Mirrors existing pagination pattern** — delegates to the shared
+   `scan_catalog` helper used by `list_listed_page` and
+   `list_by_dispute_status_page`, so clients use one consistent cursor/limit
+   contract.
+2. **No new storage** — the filter is applied at read time over the append-only
+   `Index(0..Count)` slots. Each scanned index and resource entry has its TTL
+   bumped, and slot-based cursors never skip or repeat entries when a resource's
+   status changes between pages.
+3. **If scale demands it** — an internal secondary index under `AuxKey` can be
+   introduced later without changing the public ABI or `CatalogPage` return type.
+4. **Four-valued filter + per-verifier audit log** — `Pending` powers verifier
+   review queues; `Verified`, `Rejected`, and `Revoked` support provenance and
+   revocation sweeps; `get_verifier_status_history(verifier, cursor, limit)`
+   pages a verifier's own chronological status changes (`VerifierStatusPage`).
 
 #### Implementation notes
 
@@ -633,7 +652,7 @@ if (page.next_cursor !== null) {
 | `20` | `InvalidVerificationTransition` | Verification status transition is not allowed (self-transition or revert to `Pending`). |
 | `21` | `AlreadyFrozen`                 | `freeze_metadata` was already called on this resource.                                  |
 | `22` | `MetadataFrozen`                | `update_metadata` rejected because the metadata pointer is frozen.                      |
-| `23` | `DuplicateInRepair`             | `repair_index` received a duplicate id in the supplied list.                            |
+| `23` | `DuplicateInRepair`             | `repair_index` or `repair_index_chunk` received a duplicate id in the supplied list.                            |
 | `24` | `InvalidTxHash`                 | A payment or refund `tx_hash` is empty or exceeds `MAX_TX_HASH_LEN` (128 bytes).         |
 | `25` | `InvalidPaymentAmount`          | A payment or refund `amount` is `<= 0`, or a refund window is outside its allowed bounds. |
 | `26` | `NotModerator`                  | Caller does not hold the moderator role.                                                |
@@ -668,15 +687,16 @@ if (page.next_cursor !== null) {
 
 #### Error budget
 
-This enum is **full**. The protocol caps a contract error enum at 50 cases
-(`ScSpecUdtErrorEnumV0.cases` is `VecM<_, 50>`), and codes `1`–`50` are all
-allocated, so `#[contracterror]` fails to compile with `LengthExceedsMax` on a
-`51` variant. Adding an error code therefore requires retiring an existing one
-first, and retiring a code is a breaking change for anything matching on it.
+An error enum embedded in a contract's exported spec is capped at 50 cases
+(`ScSpecUdtErrorEnumV0.cases` is `VecM<_, 50>`). This crate compiles its error
+enum with `#[contracterror(export = false)]`, which keeps the enum out of the
+embedded spec, so that XDR cap does not apply here — but retiring an allocated
+code is still a breaking change for anything matching on it, and every new
+variant grows the WASM.
 
-Plan new validation around an existing code where the semantics genuinely fit,
-or prefer a behavior that needs no new code (a documented no-op, or folding the
-case into a broader existing error) over growing the enum.
+Prefer planning new validation around an existing code where the semantics
+genuinely fit, or a behavior that needs no new code (a documented no-op, or
+folding the case into a broader existing error), over growing the enum.
 
 ### Resource ID format and reserved words
 
@@ -736,12 +756,12 @@ apart, so update all three together.
 | `emdelist` | `EmergencyDelistEvent { id, admin, reason }`                                             | `emergency_delist()` succeeds                             |
 | `setterms`  | `terms_hash: String`                                                                     | `set_terms_hash()` succeeds                                |
 | `setregt`   | `terms_hash: String`                                                                     | `set_registry_terms_hash()` succeeds                       |
-| `setadmin`  | `new_admin: Address`                                                                     | The first (bootstrap) `nominate_new_admin()` call succeeds |
-| `setrecov` | `recovery_admin: Option<Address>` | `bootstrap_dual_admin()` or `set_recovery_admin()` succeeds |
-| `recover` | `(old_admin: Address, new_admin: Address)` | `recover_admin()` succeeds |
+| `setadmin`  | `RoleRotation { actor, previous, replacement }`                                          | First `nominate_new_admin()` or `bootstrap_dual_admin()` succeeds |
+| `setrecov`  | `RoleRotation { actor, previous, replacement }`                                          | `bootstrap_dual_admin()` or `set_recovery_admin()` succeeds |
+| `recover`   | `RoleRotation { actor, previous, replacement }`                                          | `recover_admin()` succeeds |
 | `setptrs` | `MetadataPointers { pointers, primary }` (topic carries resource id) | `set_metadata_pointers()` succeeds |
-| `nomadmin`  | `new_admin: Address`                                                                     | A subsequent `nominate_new_admin()` call succeeds          |
-| `accadmin`  | `new_admin: Address`                                                                     | `accept_admin()` succeeds                                  |
+| `nomadmin`  | `RoleRotation { actor, previous, replacement }`                                          | A subsequent `nominate_new_admin()` call succeeds          |
+| `accadmin`  | `RoleRotation { actor, previous, replacement }`                                          | `accept_admin()` succeeds                                  |
 | `nomcancel` | `cancelled_nominee: Address` | `cancel_admin_nomination()` succeeds |
 | `netinit`   | `network_id: BytesN<32>`                                                                 | `initialize_network()` succeeds                            |
 | `freeze`    | `()`                                                                                     | `freeze_metadata()` succeeds                               |
@@ -758,7 +778,7 @@ apart, so update all three together.
 | `pause_until` | `(pause_until: u64, admin: Address)`                                                   | `set_paused_until()` succeeds                              |
 | `paypause`  | `(paused: bool, admin: Address)`                                                         | `set_payments_paused()` succeeds (including no-op transitions) |
 | `anchor`    | `PurchaseReceiptAnchor { resource_id, buyer, receipt_hash, ledger }`                     | `anchor_purchase_receipt()` succeeds                       |
-| `anchrfail` | `AnchorFailure { resource_id, buyer, receipt_hash, reason, ledger }`                     | `attempt_anchor_purchase_receipt()` rejects an anchor      |
+| `anchrfail` | `AnchorFailure { resource_id, buyer, receipt_hash, reason, ledger }`                     | `attempt_anchor_purchase_receipt()`, `record_anchor_failure()`, or `retry_anchor_purchase_receipt()` reports an anchor failure |
 | `anchrxhst` | `AnchorAttempts { attempts, last_attempt_ledger } (topics carry resource_id and buyer)` | `attempt_anchor_purchase_receipt()` exhausts maximum retry attempts |
 | `lease`     | `Lease { resource_id, holder, tier, start_ledger, expiry_ledger, amount, tx_hash, state, recorded_at }` | `buy_lease()` or `record_lease()` succeeds |
 | `leasesetl` | `Lease { resource_id, holder, tier, start_ledger, expiry_ledger, amount, tx_hash, state, recorded_at }` | `settle_lease()` succeeds |
@@ -766,7 +786,7 @@ apart, so update all three together.
 | `leasernw`  | `Lease { resource_id, holder, tier, start_ledger, expiry_ledger, amount, tx_hash, state, recorded_at }` | `renew_lease()` succeeds |
 | `attrevk`   | `(verifier: Address, reason_hash: String)`                                               | `revoke_attestation()` succeeds                            |
 | `refwin`    | `(old_window_ledgers: u32, new_window_ledgers: u32)`                                     | `set_refund_window()` succeeds                             |
-| `refund`    | `RefundReceipt { refund_id, payment_receipt_id, resource_id, recipient, amount, tx_hash, initiated_by, recorded_at, admin_override }` | `record_creator_refund()` or `record_admin_refund()` succeeds |
+| `refund`    | `RefundReceipt { refund_id, payment_receipt_id, resource_id, recipient, amount, tx_hash, initiated_by, recorded_at, admin_override, remaining_balance }` | `record_creator_refund()` or `record_admin_refund()` succeeds |
 | `addmod` | `RoleChange { admin, target, granted: true }` (topic also carries target) | `add_moderator()` succeeds |
 | `rmmod` | `RoleChange { admin, target, granted: false }` (topic also carries target) | `remove_moderator()` succeeds |
 | `flag`      | `FlagEvent { id, moderator, reason }`                                                    | `flag_resource()` succeeds                                 |
@@ -859,9 +879,11 @@ listing index the contract can prune in bounded gas:
 
 | Index                               | On tombstone | Effect                                                                     |
 | ----------------------------------- | ------------ | -------------------------------------------------------------------------- |
-| `TagIndex(tag)`                     | purged       | Drops out of `list_by_tag`.                                                |
-| `CreatorResources` / `CreatorCount` | purged       | Drops out of `list_by_creator`; `creator_resource_count` decrements.       |
+| `TagIndex(tag)`                     | purged       | Drops out of `list_by_tag`/`list_by_tag_page`; empty tag entry removed; `repair_tag_index` skips tombstoned resources. |
+| `CreatorResources` / `CreatorCount` | purged       | Drops out of `list_by_creator`/`list_by_creator_page`; empty creator entry removed; `creator_resource_count` decrements. |
+| `ListedCount`                       | decremented  | Only when the resource was `Listed`; `listed_count` drops by one and resource drops out of `list_listed`/`list_listed_page`. |
 | `CreatorListedCount`                | decremented  | Only when the resource was `Listed`; `creator_listed_count` drops by one.  |
+| `PendingTransfer(id)`               | removed      | Cancels any in-flight `propose_transfer` so `accept_transfer` cannot resurrect the resource. |
 | `MemoHash(id)`                      | untouched    | `get_memo_hash` keeps returning the registration memo hash for audit.      |
 | `Index(u32)` / `Count`              | untouched    | `count()` stays monotonic and `list`/`list_page` remain a full audit view. |
 | `Resource(id)`                      | untouched    | Still readable through `get` for audit purposes.                           |
@@ -869,7 +891,8 @@ listing index the contract can prune in bounded gas:
 The catalog `Index`/`Count` pair is deliberately left alone: `Count` is
 monotonic by design, and locating a resource's slot in the insertion-ordered
 index would cost a scan proportional to the catalog size. Use `repair_index`
-if that pair ever needs rebuilding. Creator mutations to price, metadata, tags, or ownership fail with
+(or `repair_index_chunk` to split the rebuild into bounded, resumable
+transactions on large registries) if that pair ever needs rebuilding. Creator mutations to price, metadata, tags, or ownership fail with
 `ResourceNotMutable` in those states. All invalid state changes, including
 attempts to exit `Tombstoned` or to reactivate a `Disputed` resource before an
 admin resolution, fail with `InvalidLifecycleTransition`.
@@ -976,6 +999,16 @@ pub struct AnchorFailure {
 }
 ```
 
+Settler recovery entry points emit the exact same `(symbol_short!("anchrfail"), resource_id)` event and additionally persist the latest `AnchorFailure` under `DataKey::AnchorFailure(resource_id, buyer)` (readable by anyone via `get_anchor_failure`, and cleared automatically once an anchor is written):
+
+| Settler entry point | Rejected because | `AnchorFailureReason` |
+| --- | --- | --- |
+| `record_anchor_failure` | Verifier role unavailable or revoked | `VerifierUnavailable` |
+| `retry_anchor_purchase_receipt` | No recorded payment exists for `(resource_id, buyer)` | `NoPaymentRecorded` |
+| `retry_anchor_purchase_receipt` | `receipt_hash` empty or over 128 bytes | `InvalidReceiptHash` |
+| `retry_anchor_purchase_receipt` | `receipt_hash` differs from the recorded payment's `tx_hash` | `ReceiptHashMismatch` |
+| `retry_anchor_purchase_receipt` | Pair already anchored with a different hash | `DuplicateReceipt` |
+
 ### Time-limited access leases
 
 A lease is the on-chain half of the access-lease design: an entitlement
@@ -1028,6 +1061,10 @@ Pending --settle_lease--> Active --(ledger >= expiry_ledger)--> expired
 or unexpired lease before expiry via `renew_lease(holder, resource_id, tier, amount, tx_hash)`.
 This extends `expiry_ledger` from the existing `expiry_ledger` by the tier duration with
 zero access gap, validates exact pricing and holder authorization, and emits `leasernw`.
+
+#### Fee Configuration Invariance
+
+Existing active leases retain their original price terms (`Lease::amount`), tier duration, and access rights (`lease_is_active`) through any registry-level fee configuration changes (`set_fee_config`, `set_fee_recipient`, or `set_fee_destination`). Fee configuration adjustments only govern future settlement splits and never retroactively alter, invalidate, or terminate pre-existing active leases. New leases and renewals calculate their price terms at execution time using `lease_price(resource_id, tier)`.
 The creator revokes with `revoke_lease`, which takes effect immediately. Revocation is
 terminal: a revoked lease remains inactive (`lease_is_active == false`) across all resource-state
 transitions (freeze, reactivation, dispute, resolve, and tombstone). `get_lease` returns
@@ -1052,14 +1089,29 @@ pause, resource id, amount, `tx_hash` shape), then looks the id up:
 | Any of `resource_id`, `payer`, `amount`, or `tx_hash` different  | `ReceiptAlreadyExists`                                                  |
 
 A retry is answered from the stored receipt, so it keeps working after the
-receipt has been settled (it comes back `Settled`) or the resource's price has
-changed since. It is still a write entry point, so it returns `ContractPaused`
-while the registry is paused, retry or not. A new `receipt_id` whose `tx_hash`
-already backs another receipt errors `DuplicateTxHash`, as with
-`record_payment`.
+receipt has been settled (it comes back `Settled`), after a partial or full
+refund has been recorded (without altering refund state), after the resource's
+price has changed, after the resource has been delisted or tombstoned, or when
+submitted by a different authorized settler during facilitator failover. It is
+still a write entry point, so it returns `ContractPaused` while either the full
+registry (`set_paused`) or payment scope (`set_payments_paused`) is paused,
+retry or not. A new `receipt_id` whose `tx_hash` already backs another receipt
+errors `DuplicateTxHash`, as with `record_payment`.
 
 `record_payment` itself is unchanged: callers that want a duplicate id to be an
 error keep calling it.
+
+**Buyer normalization and duplicate protection**: Soroban `Address` values
+normalize buyer/payer identities to canonical Stellar StrKey addresses
+(`G...`/`C...`), so round-tripping a buyer through its StrKey string resolves to
+the exact same identity for both payment receipts and purchase receipt anchors.
+Retrying an existing `receipt_id` with a different buyer (on either
+`record_payment` or `record_payment_idempotent`) fails with
+`ReceiptAlreadyExists`, writes no second payment or secondary buyer index entry
+(`PaymentIndex`, `BuyerPayments`, `BuyerResourcePayments`), does not consume the
+rejected call's `tx_hash`, and leaves the original buyer's receipt intact.
+Reusing an already-recorded `tx_hash` under a new `receipt_id` and different
+buyer fails with `DuplicateTxHash`.
 
 ### Bounded payment receipt pagination
 
@@ -1095,10 +1147,47 @@ pub struct FlagDetails {
 ```
 
 `last_moderator` is stored under `DataKey::FlagModerator(id)` and written by
-each of those three moderator calls. Rejected calls and creator writes leave it
-unchanged. Resources flagged before this key existed report `None` until a
-moderator next acts on them. Both reads error `InvalidResourceId` or `NotFound`
-like `get`, and stay available while the registry is paused.
+each of those three moderator calls, which also refresh the TTL of any attached
+`DataKey::FlagReasonHash(id)` entry so both keys stay synchronized. Rejected
+calls and creator writes leave `last_moderator` unchanged, and removing a
+moderator preserves their historical address as an audit record. Resources
+flagged before this key existed report `None` until a moderator next acts on
+them. Both reads error `InvalidResourceId` or `NotFound` like `get`, and stay
+available while the registry is paused or after a resource is tombstoned.
+
+### Multi-scheme metadata pointers
+
+To survive a single storage outage or gateway censorship, creators can attach a
+bounded set of redundant metadata pointers across schemes (such as `ipfs://`,
+`ar://`, `https://`, `http://`, `sha256:`, `sha-256:`, or `0x`) with a
+preferred-primary designation:
+
+```rust
+pub struct MetadataPointers {
+    pub pointers: Vec<String>, // 1..=MAX_METADATA_POINTERS (4) unique valid pointers
+    pub primary: u32,          // 0-based index of the preferred pointer
+}
+```
+
+- `set_metadata_pointers(id, pointers, primary)` validates every pointer with
+  the same rules as `update_metadata`, rejects empty, oversized (> 4), or
+  duplicate lists and out-of-range `primary` indices with
+  `InvalidMetadataPointers`, and mirrors `pointers[primary]` into
+  `Resource.metadata` so single-pointer readers remain fully compatible.
+- Emits `setptrs` with the stored `MetadataPointers`, plus `updmeta` whenever
+  the preferred primary pointer changed.
+- Frozen or content-hashed resources may still add or refresh mirrors as long
+  as `pointers[primary]` equals the current `Resource.metadata`; changing the
+  primary returns `MetadataFrozen`.
+- Calling `update_metadata` with a new pointer clears any stored mirror set so
+  stale mirrors are never served; a no-op `update_metadata` leaves mirrors
+  intact.
+- `get_metadata_pointers(id)` returns the stored `MetadataPointers` or falls
+  back to `[Resource.metadata]` with `primary = 0` when no mirrors are set.
+  Reads stay available while paused or after tombstoning.
+- `DataKey::MetadataPointers(id)` TTL is refreshed on `set_metadata_pointers`,
+  `get_metadata_pointers`, `extend_resource_ttl`, and any resource mutation
+  saved via `save`.
 
 ### Registry info (discovery)
 
@@ -1119,6 +1208,12 @@ For feature detection, `resource_schema_version()` returns
 `RESOURCE_SCHEMA_VERSION` as a bare `u32`, so clients can gate on
 `resource_schema_version() >= N` without decoding `contract_version()` or
 `registry_info()`.
+
+The MindVault MCP's read-only `mindvault_contract_preflight` checks the
+configured contract ID against `registry_info()`, compares `network_id` with
+the configured network passphrase, and accepts only the Resource schema version
+supported by that MCP release. The MCP runs this check before publishing or
+submitting an on-chain registration; it does not modify contract state.
 
 ### Deployment network guard
 
@@ -1259,15 +1354,34 @@ has been set, or `Unauthorized` if the caller does not match the stored admin.
 #### Payment-scope pause
 
 `set_payments_paused(admin, true)` arms a second, independent pause that blocks
-only the value-moving write paths—payments, refunds, anchors, and lease
-purchases/settlements—while catalog management and all read-only methods stay
-available.
+payment, refund, anchor, and lease state writes while catalog management and all
+read-only methods stay available. The registry does not custody or transfer
+USDC; this pause rejects registry state transitions and cannot stop off-contract
+payment transfers.
 
-Methods blocked when payment-scope paused (return `Error::ContractPaused`):
-- payments: `record_payment`, `record_payment_idempotent`, `settle_payment`
-- refunds: `record_creator_refund`, `record_admin_refund`
-- anchors: `anchor_purchase_receipt`, `attempt_anchor_purchase_receipt`, `override_purchase_receipt_anchor`, `record_anchor_failure`, `retry_anchor_purchase_receipt`
-- leases: `buy_lease`, `record_lease`, `settle_lease`, `renew_lease`
+The write-path pause matrix is:
+
+| Method | Global pause | Payment-scope pause |
+| --- | --- | --- |
+| `record_payment` | Blocked | Blocked |
+| `record_payment_idempotent` | Blocked | Blocked |
+| `settle_payment` | Blocked | Blocked |
+| `record_creator_refund` | Blocked | Blocked |
+| `record_admin_refund` | Blocked | Blocked |
+| `anchor_purchase_receipt` | Blocked | Blocked |
+| `attempt_anchor_purchase_receipt` | Blocked | Blocked |
+| `override_purchase_receipt_anchor` | Blocked | Blocked |
+| `record_anchor_failure` | Blocked | Blocked |
+| `retry_anchor_purchase_receipt` | Blocked | Blocked |
+| `buy_lease` | Blocked | Blocked |
+| `record_lease` | Blocked | Blocked |
+| `settle_lease` | Blocked | Blocked |
+| `renew_lease` | Blocked | Blocked |
+| `revoke_lease` | Blocked | Blocked |
+
+Each rejected call returns `Error::ContractPaused` without changing contract
+state. This matrix is exercised by
+[`payment_pause_matrix.rs`](./contracts/vault-registry/src/test/payment_pause_matrix.rs).
 
 The global pause remains broader (blocks all writes). `is_payments_paused()` is
 independent of `is_paused()`. `set_payments_paused` requires the current admin,
@@ -1372,3 +1486,9 @@ for the original architecture spike. The pause feature is now implemented — se
 - Tag-based discovery (`list_by_tag`) — see
   [`docs/tag-index-repair-design.md`](../docs/tag-index-repair-design.md) for
   the repair contract an on-chain tag index must satisfy before it ships.
+
+### Batch Reads and Resale Royalties (#232, #233, #236, #239)
+- `get_owner_many(ids)`: Batch ownership lookup returning a positional `Vec<Option<Address>>`.
+- `get_many_ordered(ids)`: Typed list-ordered batch resource lookup returning `Vec<ResourceBatchItem>`.
+- `set_resale_royalty(id, royalty_bps, recipient)`: Opt-in creator resale royalty (fee on transfer) capped at 2500 bps (25%).
+- `resource_schema_version()`: Directly query the integer schema version (`RESOURCE_SCHEMA_VERSION = 2`) without decoding version strings.

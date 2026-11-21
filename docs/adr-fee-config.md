@@ -127,19 +127,24 @@ pub struct FeeConfig {
 Instance storage is appropriate because fee config is a registry-global setting
 with the same TTL characteristics as `DataKey::Admin`.
 
-### Validation rules (enforced by `set_fee_config`)
+### Validation rules (enforced by `set_fee_config` and `validate_price`)
 
 | Rule                                           | Error returned    |
 | ---------------------------------------------- | ----------------- |
 | `platform_fee_bps > MAX_FEE_BPS`               | `FeeBpsTooHigh`   |
 | `royalty_bps > MAX_FEE_BPS`                    | `FeeBpsTooHigh`   |
 | `platform_fee_bps + royalty_bps > MAX_FEE_BPS` | `TotalFeeTooHigh` |
+| `price < minimum_price_floor` (`price <= platform_fee_bps + royalty_bps`) | `InvalidPrice` |
 
 Individual bounds are checked before the sum so callers receive the more
 specific error when a single field is out of range.
 
-`MAX_FEE_BPS = 5_000` (50 %). This ensures a creator always receives at least
-50 % of the sale price even in the worst-case configuration.
+`MAX_FEE_BPS = 5_000` (50 %) and `MIN_CREATOR_SHARE_BPS = 5_000` (50 %).
+Alongside the `set_fee_config` ceiling, `validate_price` enforces the semantic
+reserve-price / minimum-royalty floor (`price >= platform_fee_bps + royalty_bps + 1`,
+defaulting to `1` base unit when no fee config is active) across every
+registration and price-update path. This guarantees both `royalty_bps < price`
+and a strictly positive creator remainder of at least 50 % of every sale price.
 
 ### Constants
 

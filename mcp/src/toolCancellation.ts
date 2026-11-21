@@ -93,11 +93,15 @@ export function isToolCanceled(error: unknown): boolean {
 }
 
 /** The stable result an MCP client receives for a canceled call. */
-export function canceledToolResult(toolName: string) {
+export function canceledToolResult(
+  toolName: string,
+  transaction?: { hash: string; status: string },
+) {
   const structuredContent = {
     status: "canceled",
     tool: toolName,
     message: "The call was canceled before it finished. No state was changed.",
+    ...(transaction ? { hash: transaction.hash, transactionStatus: transaction.status } : {}),
   };
   return {
     content: [{ type: "text" as const, text: JSON.stringify(structuredContent, null, 2) }],

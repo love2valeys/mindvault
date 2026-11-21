@@ -29,6 +29,7 @@ import {
   setAuditFileWriter,
   setAuditLogEnabled,
 } from "./auditLog.js";
+import { collectAuditTail } from "./debugBundle.js";
 
 let directory: string;
 let logPath: string;
@@ -380,5 +381,151 @@ describe("audit log integration", () => {
 
     expect(existsSync(rotatedPath(logPath, 1))).toBe(true);
     expect(statSync(logPath).size).toBeLessThanOrEqual(MIN_MAX_BYTES);
+  });
+});
+
+describe("RotatingJsonlWriter – read-lock and mutex serialization (#213)", () => {
+  function entry(n: number) {
+    return { seq: n, payload: "x".repeat(40) };
+  }
+
+  function collectAllSeqs(basePath: string, maxFiles: number): number[] {
+    const seqs: number[] = [];
+    for (let generation = maxFiles; generation >= 1; generation--) {
+      const path = rotatedPath(basePath, generation);
+      if (!existsSync(path)) continue;
+      for (const line of lines(path)) seqs.push(JSON.parse(line).seq);
+    }
+    if (existsSync(basePath)) {
+      for (const line of lines(basePath)) seqs.push(JSON.parse(line).seq);
+    }
+    return seqs;
+  }
+
+  it("defers rotation across a synchronous read lock and flushes buffered tail entries on release", () => {
+    const writer = new RotatingJsonlWriter({ path: logPath, maxBytes: MIN_MAX_BYTES, maxFiles: 4 });
+
+    // Fill the live file close to the rotation limit.
+    for (let n = 0; n < 12; n++) writer.write(entry(n));
+    const snapshotBeforeLock = lines(logPath).length;
+    expect(existsSync(rotatedPath(logPath, 1))).toBe(false);
+
+    writer.withReadLockSync(() => {
+      expect(writer.readerCount).toBe(1);
+      // Write enough entries to cross maxBytes while the read lock is held.
+      for (let n = 12; n < 30; n++) writer.write(entry(n));
+
+      // Live file is untouched and unrotated while the reader holds the lock.
+      expect(lines(logPath)).toHaveLength(snapshotBeforeLock);
+      expect(existsSync(rotatedPath(logPath, 1))).toBe(false);
+      expect(writer.pendingCount).toBe(18);
+    });
+
+    // Once the read lock releases, all buffered entries flush and rotate cleanly.
+    expect(writer.readerCount).toBe(0);
+    expect(writer.pendingCount).toBe(0);
+    expect(existsSync(rotatedPath(logPath, 1))).toBe(true);
+
+    const all = collectAllSeqs(logPath, 4);
+    expect(all).toEqual(Array.from({ length: 30 }, (_, i) => i));
+  });
+
+  it("serializes concurrent writeAsync and rotateAsync across an async read lock without dropping tail entries", async () => {
+    const writer = new RotatingJsonlWriter({ path: logPath, maxBytes: MIN_MAX_BYTES, maxFiles: 4 });
+
+    writer.write(entry(0));
+    writer.write(entry(1));
+
+    let releaseReader!: () => void;
+    const readerGate = new Promise<void>((resolve) => {
+      releaseReader = resolve;
+    });
+
+    const readerPromise = writer.withReadLock(async () => {
+      const seenBefore = lines(logPath).map((l) => JSON.parse(l).seq);
+      expect(seenBefore).toEqual([0, 1]);
+      await readerGate;
+      // Live file must remain intact (not truncated or renamed) until reader exits.
+      expect(existsSync(rotatedPath(logPath, 1))).toBe(false);
+      expect(lines(logPath).map((l) => JSON.parse(l).seq)).toEqual([0, 1]);
+    });
+
+    // Concurrent sync + async appends and explicit rotation while read lock is active.
+    writer.write(entry(2));
+    const append3 = writer.writeAsync(entry(3));
+    const append4 = writer.writeAsync(entry(4));
+    const rotatePromise = writer.rotateAsync();
+    const append5 = writer.writeAsync(entry(5));
+
+    // Release the reader so queued appends and rotation can serialize and flush.
+    releaseReader();
+    await Promise.all([readerPromise, append3, append4, rotatePromise, append5]);
+
+    // Tail entries (0..4) must be flushed to the rotated file (.1), and entry 5 in the fresh live file.
+    expect(existsSync(rotatedPath(logPath, 1))).toBe(true);
+    const rotatedSeqs = lines(rotatedPath(logPath, 1)).map((l) => JSON.parse(l).seq);
+    const liveSeqs = lines(logPath).map((l) => JSON.parse(l).seq);
+
+    expect(rotatedSeqs).toEqual([0, 1, 2, 3, 4]);
+    expect(liveSeqs).toEqual([5]);
+  });
+
+  it("waits for nested/overlapping read locks to drain before rotating", async () => {
+    const writer = new RotatingJsonlWriter({ path: logPath, maxBytes: MIN_MAX_BYTES, maxFiles: 3 });
+    writer.write(entry(0));
+
+    let releaseOuter!: () => void;
+    let releaseInner!: () => void;
+    const outerGate = new Promise<void>((r) => {
+      releaseOuter = r;
+    });
+    const innerGate = new Promise<void>((r) => {
+      releaseInner = r;
+    });
+
+    const outer = writer.withReadLock(async () => {
+      await outerGate;
+    });
+    const inner = writer.withReadLock(async () => {
+      await innerGate;
+    });
+
+    expect(writer.readerCount).toBe(2);
+    writer.write(entry(1));
+    writer.rotate();
+    writer.write(entry(2));
+
+    releaseOuter();
+    await outer;
+    // Inner reader still holds a read lock: rotation must still be deferred.
+    expect(writer.readerCount).toBe(1);
+    expect(existsSync(rotatedPath(logPath, 1))).toBe(false);
+
+    releaseInner();
+    await inner;
+
+    expect(writer.readerCount).toBe(0);
+    expect(writer.pendingCount).toBe(0);
+    expect(lines(rotatedPath(logPath, 1)).map((l) => JSON.parse(l).seq)).toEqual([0, 1]);
+    expect(lines(logPath).map((l) => JSON.parse(l).seq)).toEqual([2]);
+  });
+
+  it("reads audit tail safely through collectAuditTail alongside active rotating writer", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    initAuditLogging({
+      MINDVAULT_AUDIT_LOG: "1",
+      [AUDIT_FILE_ENV_VARS.file]: logPath,
+      [AUDIT_FILE_ENV_VARS.maxBytes]: String(MIN_MAX_BYTES),
+      [AUDIT_FILE_ENV_VARS.maxFiles]: "2",
+    });
+
+    logToolSuccess("mindvault_browse", 5);
+    logToolSuccess("mindvault_search", 9);
+
+    const tail = collectAuditTail({ [AUDIT_FILE_ENV_VARS.file]: logPath }, 10);
+    expect(tail.exists).toBe(true);
+    expect(tail.entries).toHaveLength(2);
+    expect(tail.entries[0].toolName).toBe("mindvault_browse");
+    expect(tail.entries[1].toolName).toBe("mindvault_search");
   });
 });

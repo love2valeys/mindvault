@@ -213,6 +213,49 @@ export function normalizeReceiptExportOptions(
 
 // ── Export building ───────────────────────────────────────────────────────────
 
+/**
+ * Normalize a stored receipt amount into a bare, locale-neutral ASCII decimal
+ * string with no embedded currency symbol, currency code, or thousands
+ * separator (#222).
+ *
+ * Receipts across networks or gateway versions may carry formatting such as
+ * `"$1.50"`, `"$1.50 USD"`, `"1.50 USDC"`, `"USDC 1.50"`, or `"1,250.50"`.
+ * Emitting those verbatim into CSV causes spreadsheet applications to parse
+ * the `amount` column as mixed numbers and text, and causes `sumAmounts` to
+ * skip them. Stripping the currency wrapper keeps `amount` purely numeric
+ * while the dedicated `currency` column carries the unit consistently.
+ *
+ * Empty strings and unparseable non-numeric placeholders are returned trimmed
+ * so no numeric value is silently invented.
+ */
+export function normalizeReceiptAmount(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+
+  let candidate = trimmed
+    .replace(/^(?:(?:USDC|USD)\s*)+/i, "")
+    .replace(/^[$€£¥]+\s*/, "")
+    .replace(/\s*(?:USDC|USD)$/i, "")
+    .replace(/\s*[$€£¥]+$/, "")
+    .trim();
+
+  if (/^\d{1,3}(?:,\d{3})+(?:\.\d+)?$/.test(candidate)) {
+    candidate = candidate.replace(/,/g, "");
+  }
+
+  if (/^\d+(?:\.\d+)?$/.test(candidate)) {
+    return candidate;
+  }
+
+  return trimmed;
+}
+
+/** Normalize the CSV currency cell so every network emits a clean, quoted unit (#222). */
+export function normalizeCsvCurrency(currency: string | null | undefined): string {
+  const trimmed = (currency ?? "").trim();
+  return trimmed || RECEIPT_CURRENCY;
+}
+
 /** Normalize one stored receipt into an export row. */
 export function toExportedReceipt(
   receipt: PurchaseReceipt,
@@ -221,7 +264,7 @@ export function toExportedReceipt(
   return {
     resourceId: receipt.resourceId,
     title: receipt.title ?? null,
-    amount: receipt.amount,
+    amount: normalizeReceiptAmount(receipt.amount),
     currency: RECEIPT_CURRENCY,
     network: receipt.network,
     purchasedAt: receipt.timestamp,
@@ -241,7 +284,7 @@ export function toExportedReceipt(
  * recorded before the price was known) contribute nothing.
  */
 export function sumAmounts(receipts: ExportedReceipt[]): string {
-  const total = sumUsdc(receipts.map((r) => r.amount));
+  const total = sumUsdc(receipts.map((r) => normalizeReceiptAmount(r.amount)));
   return trimUsdc(total) || "0";
 }
 
@@ -256,9 +299,15 @@ export function receiptsToCsv(receipts: ExportedReceipt[]): string {
   const lines = [RECEIPT_CSV_COLUMNS.join(",")];
   for (const receipt of receipts) {
     lines.push(
-      RECEIPT_CSV_COLUMNS.map((column) => csvField(receipt[column], column === "currency")).join(
-        ",",
-      ),
+      RECEIPT_CSV_COLUMNS.map((column) => {
+        if (column === "amount") {
+          return csvField(normalizeReceiptAmount(receipt.amount), false);
+        }
+        if (column === "currency") {
+          return csvField(normalizeCsvCurrency(receipt.currency), true);
+        }
+        return csvField(receipt[column], false);
+      }).join(","),
     );
   }
   return lines.join("\r\n");

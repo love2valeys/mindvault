@@ -7,6 +7,7 @@
     {
       "asset_type": "credit_alphanum4",
       "asset_code": "USDC",
+      "asset_issuer": "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
       "balance": "1000.0000000"
     },
     {

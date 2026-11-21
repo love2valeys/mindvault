@@ -32,6 +32,8 @@ export const STATE_SERIALIZED_TOOLS: ReadonlySet<string> = new Set([
   // Mutate the profile store.
   "mindvault_reset",
   "mindvault_restore_state",
+  "mindvault_apply_state_migration",
+  "mindvault_import_state_selective",
   "mindvault_setup_wallet",
   "mindvault_import_wallet",
   "mindvault_use_profile",

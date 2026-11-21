@@ -72,6 +72,10 @@ every field without existence checks. `filters` echoes what the export was
 produced with, which makes the document self-describing once it leaves the
 session.
 
+Explorer URLs normalize Soroban x-shard transaction hashes by removing a
+leading `soroban:` prefix from the URL path. The exported `txHash` itself is
+left unchanged.
+
 `totalAmount` is summed in integer stroops (7 decimal places) rather than
 floating point, so an export of `0.1` and `0.2` totals `0.3` — not
 `0.30000000000000004`.

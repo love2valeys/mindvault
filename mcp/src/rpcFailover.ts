@@ -30,6 +30,8 @@
  * without real endpoints or real waiting.
  */
 
+import { normalizeUsdcBalanceToStroops, stroopsToUsdc } from "./usdcAmount.js";
+
 /** Environment variables controlling failover. */
 export const RPC_FAILOVER_ENV_VARS = {
   /** Comma-separated endpoint list, highest priority first. */
@@ -157,6 +159,22 @@ export interface FailoverAttempt {
   outcome: "success" | "status" | "error" | "skipped";
   status?: number;
   error?: unknown;
+}
+
+/** A USDC balance read normalized to canonical 7-decimal units across Soroban and Horizon (#219). */
+export interface NormalizedUsdcBalanceResult {
+  /** Canonical 7-decimal USDC string (e.g. `"12.5000000"`). */
+  usdc: string;
+  /** Equivalent integer stroops at Stellar's 7-decimal precision (`10^7` per USDC). */
+  stroops: bigint;
+  /** Which backend produced the reading. */
+  source: "soroban" | "horizon";
+  /** Endpoint URL that answered (Soroban RPC URL or Horizon URL). */
+  endpoint: string;
+  /** True when all Soroban RPC endpoints failed and Horizon answered instead. */
+  usedHorizonFallback: boolean;
+  /** Soroban RPC attempts performed before answering or falling back. */
+  attempts: FailoverAttempt[];
 }
 
 /** Raised when every endpoint has been tried and none could answer. */
@@ -291,6 +309,85 @@ export class RpcFailover {
     }
 
     throw new AllEndpointsFailedError(attempts, lastError);
+  }
+
+  /**
+   * Read a USDC balance via Soroban RPC failover, falling back to Horizon only
+   * when every Soroban RPC endpoint fails, and normalize both backends through
+   * the single tagged USDC unit boundary (`usdcAmount.ts`) (#219).
+   *
+   * Soroban RPC returns integer base units (`stroops`, default 7 decimals or
+   * an explicit token `decimals` base), while Horizon returns a decimal string
+   * (`"12.5000000"`). Rescaling both sides into canonical 7-decimal units at
+   * this boundary guarantees a Soroban→Horizon fallback can never silently
+   * return a 10x-wrong or 10^7x-wrong balance.
+   */
+  async runBalanceWithHorizonFallback(input: {
+    readSoroban: (
+      endpoint: string,
+    ) => Promise<
+      | { status?: number; stroops: bigint; decimals?: number }
+      | { status: number; stroops?: undefined; decimals?: undefined }
+    >;
+    horizonEndpoint: string;
+    readHorizon: (horizonEndpoint: string) => Promise<{ balance: string }>;
+    onAttempt?: (attempt: FailoverAttempt) => void;
+  }): Promise<NormalizedUsdcBalanceResult> {
+    const attempts: FailoverAttempt[] = [];
+    let answeredEndpoint = this.config.endpoints[0];
+
+    try {
+      const res = await this.run(input.readSoroban, (attempt) => {
+        attempts.push(attempt);
+        if (attempt.outcome === "success") answeredEndpoint = attempt.endpoint;
+        input.onAttempt?.(attempt);
+      });
+      if (typeof res.stroops !== "bigint") {
+        throw new Error(
+          `Soroban balance response from ${answeredEndpoint} did not include a bigint stroops balance (status=${res.status ?? "unknown"}).`,
+        );
+      }
+      const stroops = normalizeUsdcBalanceToStroops({
+        source: "soroban",
+        stroops: res.stroops,
+        decimals: res.decimals,
+      });
+      if (stroops === null) {
+        throw new Error(
+          `Soroban balance from ${answeredEndpoint} could not be normalized to canonical 7-decimal USDC stroops (decimals=${String(res.decimals)}).`,
+        );
+      }
+      return {
+        usdc: stroopsToUsdc(stroops),
+        stroops,
+        source: "soroban",
+        endpoint: answeredEndpoint,
+        usedHorizonFallback: false,
+        attempts,
+      };
+    } catch (error) {
+      if (!(error instanceof AllEndpointsFailedError)) {
+        throw error;
+      }
+      const horizonRes = await input.readHorizon(input.horizonEndpoint);
+      const stroops = normalizeUsdcBalanceToStroops({
+        source: "horizon",
+        balance: horizonRes.balance,
+      });
+      if (stroops === null) {
+        throw new Error(
+          `Horizon fallback balance from ${input.horizonEndpoint} could not be parsed as a valid USDC decimal amount.`,
+        );
+      }
+      return {
+        usdc: stroopsToUsdc(stroops),
+        stroops,
+        source: "horizon",
+        endpoint: input.horizonEndpoint,
+        usedHorizonFallback: true,
+        attempts,
+      };
+    }
   }
 }
 

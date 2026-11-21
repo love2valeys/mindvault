@@ -163,6 +163,8 @@ describe("stateMutex", () => {
     it("returns true for state-mutating tools", () => {
       expect(serializesStateTool("mindvault_reset")).toBe(true);
       expect(serializesStateTool("mindvault_restore_state")).toBe(true);
+      expect(serializesStateTool("mindvault_apply_state_migration")).toBe(true);
+      expect(serializesStateTool("mindvault_import_state_selective")).toBe(true);
       expect(serializesStateTool("mindvault_setup_wallet")).toBe(true);
       expect(serializesStateTool("mindvault_import_wallet")).toBe(true);
       expect(serializesStateTool("mindvault_use_profile")).toBe(true);
@@ -187,6 +189,7 @@ describe("stateMutex", () => {
       expect(serializesStateTool("mindvault_publish_status")).toBe(false);
       expect(serializesStateTool("mindvault_agent_status")).toBe(false);
       expect(serializesStateTool("mindvault_registry_info")).toBe(false);
+      expect(serializesStateTool("mindvault_contract_preflight")).toBe(false);
       expect(serializesStateTool("mindvault_network_profile")).toBe(false);
       expect(serializesStateTool("mindvault_check_bindings")).toBe(false);
       expect(serializesStateTool("mindvault_check_consistency")).toBe(false);
@@ -210,6 +213,8 @@ describe("stateMutex", () => {
       const expected = new Set([
         "mindvault_reset",
         "mindvault_restore_state",
+        "mindvault_apply_state_migration",
+        "mindvault_import_state_selective",
         "mindvault_setup_wallet",
         "mindvault_import_wallet",
         "mindvault_use_profile",

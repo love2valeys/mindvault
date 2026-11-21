@@ -122,4 +122,16 @@ describe("canceledToolResult", () => {
     });
     expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
   });
+
+  it("retains the transaction hash and last known status for a canceled watch", () => {
+    const result = canceledToolResult("mindvault_tx_status", {
+      hash: "abc123",
+      status: "IN_PROGRESS",
+    });
+    expect(result.structuredContent).toMatchObject({
+      status: "canceled",
+      hash: "abc123",
+      transactionStatus: "IN_PROGRESS",
+    });
+  });
 });

@@ -113,7 +113,12 @@ function horizonBalancesFixture(): object {
         "Snapshot of the mock Horizon GET /accounts/:pk response — a funded testnet account with USDC and native XLM.",
     },
     balances: [
-      { asset_type: "credit_alphanum4", asset_code: "USDC", balance: "1000.0000000" },
+      {
+        asset_type: "credit_alphanum4",
+        asset_code: "USDC",
+        asset_issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        balance: "1000.0000000",
+      },
       { asset_type: "native", balance: "100.0000000" },
     ],
   };

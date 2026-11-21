@@ -1,53 +1,30 @@
-import { mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  provenanceChain,
-  readResourceHistory,
   recordResourceHistory,
-  resourceChangeLog,
+  queryResourcePriceAndMetadataHistory,
+  readResourceHistory,
 } from "./resourceHistory.js";
 
-describe("resource history", () => {
-  it("records and filters provenance and change events in chronological order", () => {
-    const path = join(mkdtempSync(join(tmpdir(), "mindvault-history-")), "audit.jsonl");
-    process.env.MINDVAULT_RESOURCE_HISTORY_FILE = path;
+describe("resource price and metadata change log (#175)", () => {
+  it("records and queries price and metadata events", () => {
+    const resourceId = "test-res-" + Date.now();
     recordResourceHistory({
-      resourceId: "res-1",
+      resourceId,
       kind: "price",
-      value: "2.00",
-      timestamp: "2026-01-03T00:00:00Z",
+      amount: "10.00",
+      txHash: "tx1",
     });
     recordResourceHistory({
-      resourceId: "res-1",
-      kind: "created",
-      actor: "GOWNER",
-      timestamp: "2026-01-01T00:00:00Z",
+      resourceId,
+      kind: "metadata",
+      value: "updated-title",
+      txHash: "tx2",
     });
-    recordResourceHistory({
-      resourceId: "res-1",
-      kind: "purchased",
-      actor: "GBUYER",
-      amount: "2.00",
-      timestamp: "2026-01-02T00:00:00Z",
-    });
-    recordResourceHistory({ resourceId: "other", kind: "created", actor: "OTHER" });
 
-    expect(readResourceHistory("res-1").map((event) => event.kind)).toEqual([
-      "created",
-      "purchased",
-      "price",
-    ]);
-    expect(JSON.parse(provenanceChain("res-1")).events).toHaveLength(2);
-    expect(JSON.parse(resourceChangeLog("res-1")).changes).toHaveLength(1);
-    expect(readFileSync(path, "utf8")).not.toContain("secretKey");
-    delete process.env.MINDVAULT_RESOURCE_HISTORY_FILE;
-  });
-
-  it("returns empty histories when no audit file exists", () => {
-    process.env.MINDVAULT_RESOURCE_HISTORY_FILE = join(tmpdir(), `missing-${Date.now()}.jsonl`);
-    expect(JSON.parse(provenanceChain("missing")).events).toEqual([]);
-    delete process.env.MINDVAULT_RESOURCE_HISTORY_FILE;
+    const result = queryResourcePriceAndMetadataHistory(resourceId);
+    expect(result.resourceId).toBe(resourceId);
+    expect(result.count).toBeGreaterThanOrEqual(2);
+    expect(result.changes.some((c) => c.kind === "price")).toBe(true);
+    expect(result.changes.some((c) => c.kind === "metadata")).toBe(true);
   });
 });

@@ -56,6 +56,19 @@ export function normalizeSettlementWaitFlag(raw: unknown): boolean {
   );
 }
 
+export function normalizeSettlementWaitPolicy(rawWait: unknown, rawPolicy: unknown): boolean {
+  const wait = normalizeSettlementWaitFlag(rawWait);
+  if (rawPolicy === undefined || rawPolicy === null || rawPolicy === "") return wait;
+  if (rawPolicy !== "return_after_submit" && rawPolicy !== "wait_for_final_result") {
+    throw new Error('waitPolicy must be "return_after_submit" or "wait_for_final_result".');
+  }
+  const policyWait = rawPolicy === "wait_for_final_result";
+  if (rawWait !== undefined && rawWait !== null && rawWait !== "" && wait !== policyWait) {
+    throw new Error("wait and waitPolicy specify conflicting settlement behavior.");
+  }
+  return policyWait;
+}
+
 export function normalizeSettlementTimeoutMs(raw: unknown): number {
   if (raw === undefined || raw === null || raw === "") return DEFAULT_SETTLEMENT_TIMEOUT_MS;
   const n = typeof raw === "number" ? raw : Number(String(raw).trim());
@@ -92,6 +105,7 @@ export interface SettlementSnapshot {
   timedOut: boolean;
   attempts: number;
   skipped: boolean;
+  retryable: boolean;
   message: string;
 }
 
@@ -113,19 +127,22 @@ export function buildSettlementSnapshot(input: {
   const polled = wait && !skipped && input.result !== null;
 
   if (!polled) {
+    const message = txHash
+      ? `Payment transaction submitted (${txHash}). Settlement was not checked; pass wait: true or waitPolicy: "wait_for_final_result" to wait, or use mindvault_tx_status to check it later.`
+      : wait && skipped
+        ? skippedSettlementMessage("no-tx-hash")
+        : skippedSettlementMessage("no-wait");
     return {
       polled,
       txHash: txHash ?? null,
-      status: null,
+      status: txHash ? "SUBMITTED" : null,
       settled: false,
       success: false,
       timedOut: false,
       attempts: 0,
       skipped: wait && skipped,
-      message:
-        wait && skipped
-          ? skippedSettlementMessage("no-tx-hash")
-          : skippedSettlementMessage("no-wait"),
+      retryable: Boolean(txHash),
+      message,
     };
   }
 
@@ -159,6 +176,7 @@ export function buildSettlementSnapshot(input: {
     timedOut,
     attempts,
     skipped,
+    retryable: !settled,
     message,
   };
 }

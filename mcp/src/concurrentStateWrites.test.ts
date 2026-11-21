@@ -27,10 +27,10 @@
  * holds the key that was actually meant for it.
  */
 
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from "fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { afterAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Mutex } from "./mutex.js";
 
@@ -74,6 +74,18 @@ function makeIdentities(count: number, prefix: string): TestIdentity[] {
   });
 }
 
+async function previewIdentities(identities: TestIdentity[]): Promise<void> {
+  await Promise.all(
+    identities.map((identity) =>
+      dispatchTool("mindvault_import_wallet", {
+        secretKey: identity.secretKey,
+        profile: identity.profile,
+        network: "testnet",
+      }),
+    ),
+  );
+}
+
 /** The persisted state file, parsed. Throws if it is missing or not JSON. */
 function readPersistedState(): {
   version: number;
@@ -93,14 +105,70 @@ beforeEach(() => {
 });
 
 describe("concurrent state writes (#591)", () => {
+  it("previews imports without writing and persists only after address confirmation", async () => {
+    const [identity] = makeIdentities(1, "confirmed");
+    const preview = await dispatchTool("mindvault_import_wallet", {
+      secretKey: identity.secretKey,
+      profile: identity.profile,
+      network: "testnet",
+    });
+
+    expect(preview).toContain(identity.publicKey);
+    expect(preview).not.toContain(identity.secretKey);
+    expect(existsSync(STATE_FILE)).toBe(false);
+
+    await expect(
+      dispatchTool("mindvault_import_wallet", {
+        secretKey: identity.secretKey,
+        profile: identity.profile,
+        network: "testnet",
+        confirmAddress: makeIdentities(1, "different")[0].publicKey,
+        persist: true,
+      }),
+    ).rejects.toThrow("confirmAddress must exactly match the derived address");
+    expect(existsSync(STATE_FILE)).toBe(false);
+
+    await dispatchTool("mindvault_import_wallet", {
+      secretKey: identity.secretKey,
+      profile: identity.profile,
+      network: "testnet",
+      confirmAddress: identity.publicKey,
+      persist: true,
+    });
+    expect(readPersistedState().profiles[identity.profile]?.wallet?.publicKey).toBe(
+      identity.publicKey,
+    );
+  });
+
+  it("does not expose SDK secret parsing errors", async () => {
+    const secretKey = `S${"A".repeat(55)}`;
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const error = await dispatchTool("mindvault_import_wallet", { secretKey }).catch(
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toBe(
+        "Invalid Stellar secret key; unable to derive a public address.",
+      );
+      expect((error as Error).message).not.toContain(secretKey);
+      expect(log.mock.calls.flat().join(" ")).not.toContain(secretKey);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("persists every profile when imports overlap", async () => {
     const identities = makeIdentities(CONCURRENCY, "overlap");
+    await previewIdentities(identities);
 
     await Promise.all(
       identities.map((id) =>
         dispatchTool("mindvault_import_wallet", {
           secretKey: id.secretKey,
           profile: id.profile,
+          network: "testnet",
+          confirmAddress: id.publicKey,
           persist: true,
         }),
       ),
@@ -115,12 +183,15 @@ describe("concurrent state writes (#591)", () => {
     // reassigned by a later call while an earlier one is suspended on its
     // `await`, so the earlier call's wallet lands under the later call's name.
     const identities = makeIdentities(CONCURRENCY, "crosstalk");
+    await previewIdentities(identities);
 
     await Promise.all(
       identities.map((id) =>
         dispatchTool("mindvault_import_wallet", {
           secretKey: id.secretKey,
           profile: id.profile,
+          network: "testnet",
+          confirmAddress: id.publicKey,
           persist: true,
         }),
       ),
@@ -141,6 +212,7 @@ describe("concurrent state writes (#591)", () => {
     // one. Reading between every await of the in-flight batch is the closest a
     // single-process test can get to a concurrent reader.
     const identities = makeIdentities(CONCURRENCY, "atomic");
+    await previewIdentities(identities);
     const observations: number[] = [];
 
     const writes = Promise.all(
@@ -148,6 +220,8 @@ describe("concurrent state writes (#591)", () => {
         dispatchTool("mindvault_import_wallet", {
           secretKey: id.secretKey,
           profile: id.profile,
+          network: "testnet",
+          confirmAddress: id.publicKey,
           persist: true,
         }),
       ),
@@ -177,12 +251,15 @@ describe("concurrent state writes (#591)", () => {
 
   it("preserves 0600 on the state file across concurrent writes", async () => {
     const identities = makeIdentities(CONCURRENCY, "perms");
+    await previewIdentities(identities);
 
     await Promise.all(
       identities.map((id) =>
         dispatchTool("mindvault_import_wallet", {
           secretKey: id.secretKey,
           profile: id.profile,
+          network: "testnet",
+          confirmAddress: id.publicKey,
           persist: true,
         }),
       ),
@@ -197,6 +274,7 @@ describe("concurrent state writes (#591)", () => {
     // subsequent state-mutating tool — the server would look hung rather than
     // broken, which is the harder failure to diagnose.
     const good = makeIdentities(4, "after-failure");
+    await previewIdentities(good);
 
     const results = await Promise.allSettled([
       dispatchTool("mindvault_import_wallet", { secretKey: "not-a-stellar-key", persist: true }),
@@ -204,6 +282,8 @@ describe("concurrent state writes (#591)", () => {
         dispatchTool("mindvault_import_wallet", {
           secretKey: id.secretKey,
           profile: id.profile,
+          network: "testnet",
+          confirmAddress: id.publicKey,
           persist: true,
         }),
       ),
@@ -224,6 +304,7 @@ describe("concurrent state writes (#591)", () => {
     // not queue behind a slow write. This pins that the exemption is safe:
     // interleaving reads must not cost the writers any of their updates.
     const identities = makeIdentities(CONCURRENCY, "with-reads");
+    await previewIdentities(identities);
 
     await Promise.all([
       ...identities.map((id) =>

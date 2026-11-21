@@ -167,8 +167,57 @@ export type CatalogPage<T> = {
 };
 
 const CATALOG_DEFAULT_LIMIT = 20;
+const PRICE_DECIMAL_RE = /^\d+(\.\d+)?$/;
+const CATALOG_CURRENCY = "USDC";
 
-function sortRows<T extends { price: string; title: string; createdAt: Date | string }>(
+/**
+ * Search-term normalization matching `mcp/src/catalogSearchTerm.ts` so server
+ * and client catalog filters fold Unicode and whitespace identically.
+ */
+function normalizeSearchTerm(value: string): string {
+  return value.normalize("NFC").toLowerCase().replace(/\s+/gu, " ").trim();
+}
+
+/**
+ * Exact non-negative decimal string comparison (arbitrary fractional precision)
+ * matching `mcp/src/catalogFilters.ts#compareDecimalStrings`.
+ */
+function compareDecimalStrings(a: string, b: string): number | null {
+  const left = a.trim();
+  const right = b.trim();
+  if (!PRICE_DECIMAL_RE.test(left) || !PRICE_DECIMAL_RE.test(right)) return null;
+  const [leftInt, leftFrac = ""] = left.split(".");
+  const [rightInt, rightFrac = ""] = right.split(".");
+  const intA = BigInt(leftInt);
+  const intB = BigInt(rightInt);
+  if (intA !== intB) return intA < intB ? -1 : 1;
+  const maxFrac = Math.max(leftFrac.length, rightFrac.length);
+  const fracA = leftFrac.padEnd(maxFrac, "0");
+  const fracB = rightFrac.padEnd(maxFrac, "0");
+  if (fracA === fracB) return 0;
+  return fracA < fracB ? -1 : 1;
+}
+
+function isUsdcCurrency(currency: unknown): boolean {
+  if (currency === undefined || currency === null) return true;
+  if (typeof currency !== "string") return false;
+  const normalized = currency.trim().toUpperCase();
+  return normalized === "" || normalized === CATALOG_CURRENCY;
+}
+
+function comparePriceSort(a: string, b: string, direction: "asc" | "desc"): number {
+  const aRaw = a.trim();
+  const bRaw = b.trim();
+  const aValid = PRICE_DECIMAL_RE.test(aRaw);
+  const bValid = PRICE_DECIMAL_RE.test(bRaw);
+  if (!aValid && !bValid) return 0;
+  if (!aValid) return 1;
+  if (!bValid) return -1;
+  const cmp = compareDecimalStrings(aRaw, bRaw) ?? 0;
+  return direction === "asc" ? cmp : -cmp;
+}
+
+export function sortCatalogRows<T extends { price: string; title: string; createdAt?: Date | string }>(
   rows: T[],
   sort: CatalogSort,
 ): T[] {
@@ -178,16 +227,23 @@ function sortRows<T extends { price: string; title: string; createdAt: Date | st
   const sorted = [...rows];
   switch (sort) {
     case "price_asc":
-      sorted.sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+      sorted.sort((a, b) => comparePriceSort(a.price, b.price, "asc"));
       break;
     case "price_desc":
-      sorted.sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+      sorted.sort((a, b) => comparePriceSort(a.price, b.price, "desc"));
       break;
     case "title":
       sorted.sort((a, b) => a.title.localeCompare(b.title));
       break;
   }
   return sorted;
+}
+
+function sortRows<T extends { price: string; title: string; createdAt: Date | string }>(
+  rows: T[],
+  sort: CatalogSort,
+): T[] {
+  return sortCatalogRows(rows, sort);
 }
 
 async function queryCatalog() {
@@ -227,6 +283,7 @@ export function applyCatalogFilters<
     title: string;
     description: string | null;
     price: string;
+    currency?: string;
     verificationStatus: string;
     resourceType: string;
     publisherName: string;
@@ -235,22 +292,33 @@ export function applyCatalogFilters<
 >(rows: T[], filters?: CatalogListFilters): T[] {
   if (!filters) return rows;
 
-  const search = filters.search?.toLowerCase();
-  const owner = filters.owner?.toLowerCase();
-  // Prices are stored as decimal strings (e.g. "0.50"); compare numerically and
-  // inclusively, parsing only at the point of comparison.
-  const min = filters.minPrice !== undefined ? parseFloat(filters.minPrice) : undefined;
-  const max = filters.maxPrice !== undefined ? parseFloat(filters.maxPrice) : undefined;
+  const search = filters.search ? normalizeSearchTerm(filters.search) : undefined;
+  const owner = filters.owner?.trim().toLowerCase() || undefined;
+  // Prices are stored as decimal strings (e.g. "0.50"); compare with exact
+  // decimal precision and inclusively so "0.5", "0.50", and "0.5000000" match
+  // identically across server and MCP client-side filtering.
+  const min = filters.minPrice !== undefined ? filters.minPrice.trim() : undefined;
+  const max = filters.maxPrice !== undefined ? filters.maxPrice.trim() : undefined;
 
   return rows.filter((r) => {
-    if (
-      search &&
-      !(r.title?.toLowerCase().includes(search) || r.description?.toLowerCase().includes(search))
-    ) {
-      return false;
+    if (search) {
+      const title = normalizeSearchTerm(r.title ?? "");
+      const description = normalizeSearchTerm(r.description ?? "");
+      if (!title.includes(search) && !description.includes(search)) {
+        return false;
+      }
     }
-    if (min !== undefined && parseFloat(r.price) < min) return false;
-    if (max !== undefined && parseFloat(r.price) > max) return false;
+    if (min !== undefined || max !== undefined) {
+      if (!isUsdcCurrency(r.currency)) return false;
+      if (min !== undefined) {
+        const cmp = compareDecimalStrings(r.price, min);
+        if (cmp === null || cmp < 0) return false;
+      }
+      if (max !== undefined) {
+        const cmp = compareDecimalStrings(r.price, max);
+        if (cmp === null || cmp > 0) return false;
+      }
+    }
     if (filters.verificationStatus && r.verificationStatus !== filters.verificationStatus) {
       return false;
     }

@@ -165,7 +165,12 @@ export function createMockFetch(
     if (method === "GET" && pathname.startsWith("/accounts/")) {
       return json({
         balances: [
-          { asset_type: "credit_alphanum4", asset_code: "USDC", balance: "1000.0000000" },
+          {
+            asset_type: "credit_alphanum4",
+            asset_code: "USDC",
+            asset_issuer: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+            balance: "1000.0000000",
+          },
           { asset_type: "native", balance: "100.0000000" },
         ],
       });
@@ -385,12 +390,20 @@ export function mockSetPrice(resourceId: string, price: string): string {
   );
 }
 
-export function mockTransferOwnership(resourceId: string, newCreator: string): string {
+export function mockTransferOwnership(
+  resourceId: string,
+  newCreator: string,
+  newTermsHash?: string,
+  resetAttestation = false,
+): string {
   return JSON.stringify(
     {
       status: "success",
       resourceId,
       newCreator,
+      ...(newTermsHash !== undefined || resetAttestation
+        ? { newTermsHash: newTermsHash ?? null, attestationReset: resetAttestation }
+        : {}),
       txHash: `MOCK_TX_TRANSFER_${resourceId}`,
       explorerUrl: explorerTxUrl(`MOCK_TX_TRANSFER_${resourceId}`),
       source: "on-chain (mock)",
@@ -448,6 +461,62 @@ export function mockPendingTransfer(resourceId: string): string {
     null,
     2,
   );
+}
+
+export function mockPublisherTerms(
+  operation: string,
+  creator?: string,
+  termsHash?: string,
+): string {
+  if (operation === "get") {
+    const address = creator ?? "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH";
+    if (
+      address === "mock-unknown" ||
+      address === "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+    ) {
+      return JSON.stringify(
+        {
+          creator: address,
+          termsHash: null,
+          found: false,
+          source: "on-chain (mock)",
+        },
+        null,
+        2,
+      );
+    }
+    return JSON.stringify(
+      {
+        creator: address,
+        termsHash: "mock-terms-hash-1",
+        found: true,
+        source: "on-chain (mock)",
+      },
+      null,
+      2,
+    );
+  }
+
+  if (operation === "set") {
+    if (!termsHash || !termsHash.trim()) throw new Error("termsHash is required for set.");
+    const trimmed = termsHash.trim();
+    if (trimmed.length > 64) {
+      throw new Error("termsHash must be at most 64 characters.");
+    }
+    const address = creator ?? "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH";
+    return JSON.stringify(
+      {
+        status: "success",
+        creator: address,
+        termsHash: trimmed,
+        source: "on-chain (mock)",
+      },
+      null,
+      2,
+    );
+  }
+
+  throw new Error(`Unknown operation "${operation}". Use "get" or "set".`);
 }
 
 export function mockSetListed(resourceId: string, listed: boolean): string {

@@ -65,6 +65,15 @@ describe("explorerTxUrl", () => {
     );
   });
 
+  it("removes the Soroban x-shard prefix from transaction hashes", () => {
+    expect(explorerTxUrl("soroban:abc123", "testnet")).toBe(
+      "https://stellar.expert/explorer/testnet/tx/abc123",
+    );
+    expect(explorerTxUrl(" SOROBAN:abc123 ", "public")).toBe(
+      "https://stellar.expert/explorer/public/tx/abc123",
+    );
+  });
+
   it("resolves the network from STELLAR_NETWORK when no segment is passed", () => {
     process.env.STELLAR_NETWORK = "mainnet";
     expect(explorerTxUrl("abc123")).toBe("https://stellar.expert/explorer/public/tx/abc123");

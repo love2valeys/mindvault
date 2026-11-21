@@ -14,6 +14,7 @@ import {
   canonicalizeMetadataHash,
   describeMetadataPointerHash,
   isValidMetadataHash,
+  normalizeMetadataPointer,
   parseMetadataHash,
 } from "./metadataHash.js";
 
@@ -216,5 +217,42 @@ describe("describeMetadataPointerHash", () => {
 
   it("reports JSON that is not an object", () => {
     expect(describeMetadataPointerHash("[1,2]").reason).toContain("not an object");
+  });
+});
+
+describe("normalizeMetadataPointer", () => {
+  it("strips single and repeated trailing slashes from HTTP(S) paths", () => {
+    expect(normalizeMetadataPointer("https://example.com/meta.json/")).toBe(
+      "https://example.com/meta.json",
+    );
+    expect(normalizeMetadataPointer("https://example.com/meta.json///")).toBe(
+      "https://example.com/meta.json",
+    );
+  });
+
+  it("produces identical output for equivalent publish and update pointers", () => {
+    const published = normalizeMetadataPointer("https://example.com/resources/guide?a=1&b=2");
+    const updated = normalizeMetadataPointer("  HTTPS://Example.COM/resources/guide/?b=2&a=1  ");
+    expect(updated).toBe(published);
+    expect(updated).toBe("https://example.com/resources/guide?a=1&b=2");
+  });
+
+  it("preserves the root path slash on bare origins", () => {
+    expect(normalizeMetadataPointer("https://example.com/")).toBe("https://example.com/");
+    expect(normalizeMetadataPointer("https://example.com")).toBe("https://example.com/");
+  });
+
+  it("passes non-HTTP schemes through trimmed without mutation", () => {
+    expect(normalizeMetadataPointer("  ipfs://QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79o  ")).toBe(
+      "ipfs://QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79o",
+    );
+    expect(normalizeMetadataPointer("ar://abc123")).toBe("ar://abc123");
+    expect(normalizeMetadataPointer(`sha256:${SHA256}`)).toBe(`sha256:${SHA256}`);
+  });
+
+  it("returns malformed HTTP(S) URLs trimmed without throwing", () => {
+    expect(normalizeMetadataPointer("  https://not a valid url/  ")).toBe(
+      "https://not a valid url/",
+    );
   });
 });

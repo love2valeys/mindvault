@@ -16,6 +16,14 @@ unaffordable payment through.
 
 Source: [`mcp/src/usdcAmount.ts`](../mcp/src/usdcAmount.ts).
 
+## Identifying the asset
+
+A Horizon balance is canonical USDC only when its asset code is `USDC` and its
+issuer matches the selected network's `usdcClassicIssuer` preset. A token with
+the same symbol from another issuer is ignored. Soroban payments use the
+selected network's `usdcSacContractId`; the SAC and classic trustline identify
+the same underlying issuer asset.
+
 ## One conversion, tagged at the boundary
 
 The factor is defined once (`STROOPS_PER_USDC`) and every amount that crosses a
@@ -62,14 +70,22 @@ though funds were sufficient.
 ## Failover and units
 
 `rpcFailover` fans a request across several **Soroban RPC** endpoints, which all
-speak stroops, so failing over between them cannot change the scale. There is no
-Soroban→Horizon balance fallback today: `getBalanceDetails` reads Horizon only.
+speak integer base units, and exposes `RpcFailover.runBalanceWithHorizonFallback`
+for Soroban→Horizon balance checks.
 
-Issue #838 describes what such a fallback would do if one were added naively —
-return a balance off by 10<sup>7</sup>, silently. The tagged boundary above is
-what makes adding one safe: a Soroban balance read enters as
-`{ source: "soroban", stroops }` and is converted at the edge, or it does not
-compile.
+When a Soroban token or adapter reports a different decimal base (for example 6
+decimals vs Stellar's 7-decimal stroops, a 10x difference) or when failover
+switches from Soroban integer stroops to Horizon decimal strings (a
+10<sup>7</sup>x difference), both readings pass through
+`normalizeUsdcBalanceToStroops` / `normalizeUsdcBalance` at the failover
+boundary so callers always receive identical canonical 7-decimal `usdc` and
+`stroops` values.
+
+```ts
+normalizeUsdcBalanceToStroops({ source: "soroban", stroops: 12_500_000n, decimals: 6 }); // 125_000_000n
+normalizeUsdcBalanceToStroops({ source: "soroban", stroops: 125_000_000n }); // 125_000_000n
+normalizeUsdcBalanceToStroops({ source: "horizon", balance: "12.5000000" }); // 125_000_000n
+```
 
 ## Coverage
 

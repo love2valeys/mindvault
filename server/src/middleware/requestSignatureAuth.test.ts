@@ -72,6 +72,60 @@ describe("requestSignatureAuth", () => {
     expect(next).toHaveBeenCalledOnce();
   });
 
+  it("validates the query string as part of the signed path", () => {
+    const signedPath = `${path}?page=1&sort=created`;
+    const querySignature = signPublisherRequest({
+      secret,
+      method: "POST",
+      path: signedPath,
+      timestamp,
+      bodyHash,
+    });
+    const req = {
+      method: "POST",
+      originalUrl: signedPath,
+      headers: {
+        "x-api-key": secret,
+        "x-timestamp": timestamp,
+        "x-signature": querySignature,
+      },
+      rawBody: Buffer.from(rawBody, "utf8"),
+    } as unknown as Request;
+    const res = mockResponse();
+    const next = vi.fn() as NextFunction;
+
+    requestSignatureAuth(req, res, next);
+    expect(next).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a request whose query changes after signing", () => {
+    const signedPath = `${path}?page=1&sort=created`;
+    const querySignature = signPublisherRequest({
+      secret,
+      method: "POST",
+      path: signedPath,
+      timestamp,
+      bodyHash,
+    });
+    const req = {
+      method: "POST",
+      originalUrl: `${path}?page=2&sort=created`,
+      headers: {
+        "x-api-key": secret,
+        "x-timestamp": timestamp,
+        "x-signature": querySignature,
+      },
+      rawBody: Buffer.from(rawBody, "utf8"),
+    } as unknown as Request;
+    const res = mockResponse();
+    const next = vi.fn() as NextFunction;
+
+    requestSignatureAuth(req, res, next);
+    expect(next).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(401);
+    expect(res.body).toEqual({ error: "Invalid request signature" });
+  });
+
   it("rejects a stale timestamp", () => {
     vi.setSystemTime(new Date(Number(timestamp) * 1000 + 600_000));
     const req = {

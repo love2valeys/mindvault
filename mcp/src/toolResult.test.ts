@@ -21,13 +21,27 @@ describe("parseStructuredObject", () => {
 });
 
 describe("normalizeToolResult", () => {
-  const withSchema = (name: string) => name === "mindvault_preview";
-  const none = () => false;
+  const schema = {
+    oneOf: [
+      {
+        type: "object",
+        properties: { id: { type: "string" } },
+        required: ["id"],
+      },
+      {
+        type: "object",
+        properties: { status: { type: "string", const: "text" }, message: { type: "string" } },
+        required: ["status", "message"],
+      },
+    ],
+  };
+  const withSchema = (name: string) => (name === "mindvault_preview" ? schema : undefined);
+  const none = () => undefined;
 
   it("attaches structuredContent when the text is a JSON object and the tool has a schema", () => {
     const result = normalizeToolResult(
       "mindvault_preview",
-      JSON.stringify({ id: "res-1", price: "$1.50 USDC" }, null, 2),
+      JSON.stringify({ id: "res-1" }, null, 2),
       withSchema,
     );
     expect(result.content[0].text).toContain('"id": "res-1"');
@@ -60,5 +74,16 @@ describe("normalizeToolResult", () => {
     const result = normalizeToolResult("mindvault_preview", text, withSchema);
     expect(result.content[0].text).toBe(text);
     expect(result.structuredContent).toEqual(textFallback(text));
+  });
+
+  it("rejects invalid structured output without returning the payload", () => {
+    const result = normalizeToolResult(
+      "mindvault_preview",
+      { text: "contains a private value", structured: { secret: "sensitive" } },
+      withSchema,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).not.toContain("sensitive");
+    expect(result.structuredContent).toBeUndefined();
   });
 });

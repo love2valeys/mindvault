@@ -195,3 +195,115 @@ fn flag_moderator_entry_gets_a_ttl_on_write() {
         "the last-moderator entry must be bumped like the flag reason hash, got TTL {ttl}"
     );
 }
+
+#[test]
+fn flag_details_updates_reason_and_moderator_on_reflag_while_keeping_reason_hash() {
+    let (env, creator, _admin, first, client) = setup_with_moderator();
+    let second = Address::generate(&env);
+    client.add_moderator(&second);
+    let id = register_default(&env, &creator, &client, "fdreflag");
+
+    client.flag_resource(&id, &first, &FlagReason::Spam);
+    client.set_flag_reason_hash(&id, &first, &reason_hash(&env, "sha256:fdreflag"));
+    client.flag_resource(&id, &second, &FlagReason::Malicious);
+
+    assert!(client.is_flagged(&id));
+    assert_eq!(
+        client.flag_details(&id),
+        FlagDetails {
+            dispute_flag: DisputeFlag::Flagged(FlagReason::Malicious),
+            reason_hash: Some(reason_hash(&env, "sha256:fdreflag")),
+            last_moderator: Some(second),
+        }
+    );
+}
+
+#[test]
+fn flag_details_preserves_last_moderator_after_moderator_removal() {
+    let (env, creator, _admin, moderator, client) = setup_with_moderator();
+    let id = register_default(&env, &creator, &client, "fdrevoked");
+
+    client.flag_resource(&id, &moderator, &FlagReason::Copyright);
+    client.remove_moderator(&moderator);
+
+    assert!(client.is_flagged(&id));
+    assert_eq!(client.flag_details(&id).last_moderator, Some(moderator));
+}
+
+#[test]
+fn flag_details_and_is_flagged_remain_readable_on_tombstoned_resource() {
+    let (env, creator, admin, moderator, client) = setup_with_moderator();
+    let id = register_default(&env, &creator, &client, "fdtomb");
+
+    client.flag_resource(&id, &moderator, &FlagReason::Malicious);
+    client.set_flag_reason_hash(&id, &moderator, &reason_hash(&env, "sha256:fdtomb"));
+    client.tombstone_resource(&id, &admin);
+
+    assert!(client.is_flagged(&id));
+    assert_eq!(
+        client.flag_details(&id),
+        FlagDetails {
+            dispute_flag: DisputeFlag::Flagged(FlagReason::Malicious),
+            reason_hash: Some(reason_hash(&env, "sha256:fdtomb")),
+            last_moderator: Some(moderator),
+        }
+    );
+}
+
+#[test]
+fn flag_details_handles_legacy_flagged_resource_without_moderator_entry() {
+    let (env, creator, _admin, moderator, client) = setup_with_moderator();
+    let id = register_default(&env, &creator, &client, "fdlegacy");
+
+    client.flag_resource(&id, &moderator, &FlagReason::Spam);
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::FlagModerator(id.clone()));
+    });
+
+    assert!(client.is_flagged(&id));
+    assert_eq!(
+        client.flag_details(&id),
+        FlagDetails {
+            dispute_flag: DisputeFlag::Flagged(FlagReason::Spam),
+            reason_hash: None,
+            last_moderator: None,
+        }
+    );
+
+    // Subsequent moderator action repopulates `last_moderator`.
+    client.unflag_resource(&id, &moderator);
+    assert!(!client.is_flagged(&id));
+    assert_eq!(client.flag_details(&id).last_moderator, Some(moderator));
+}
+
+#[test]
+fn flag_moderator_write_refreshes_existing_reason_hash_ttl() {
+    let (env, creator, _admin, moderator, client) = setup_with_moderator();
+    let id = register_default(&env, &creator, &client, "fdrsnttl");
+
+    client.flag_resource(&id, &moderator, &FlagReason::Spam);
+    client.set_flag_reason_hash(&id, &moderator, &reason_hash(&env, "sha256:ttl"));
+
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + TTL_DAY_IN_LEDGERS + 1);
+
+    client.unflag_resource(&id, &moderator);
+
+    let (mod_ttl, reason_ttl) = env.as_contract(&client.address, || {
+        (
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::FlagModerator(id.clone())),
+            env.storage()
+                .persistent()
+                .get_ttl(&DataKey::FlagReasonHash(id.clone())),
+        )
+    });
+    assert_eq!(mod_ttl, TTL_BUMP_AMOUNT);
+    assert_eq!(
+        reason_ttl, TTL_BUMP_AMOUNT,
+        "moderator actions must keep attached FlagReasonHash TTL synchronized"
+    );
+}

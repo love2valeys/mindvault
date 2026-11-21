@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { createCipheriv, randomBytes, scryptSync } from "crypto";
 import * as fs from "fs";
 import {
   chmodSync,
@@ -23,6 +24,8 @@ import {
   quarantineStateFile,
   preserveLegacyState,
   writeAtomically,
+  exportSelectiveState,
+  importSelectiveState,
 } from "./stateBackup.js";
 import { STATE_VERSION, type ProfileState } from "./profiles.js";
 
@@ -37,7 +40,7 @@ const sample: ProfileState = {
     publisher: {
       wallet: { publicKey: "GPUB", secretKey: "SSECRET" },
       apiKey: "api-key-xyz",
-      network: "stellar:testnet",
+      network: "testnet",
     },
     buyer: {
       wallet: { publicKey: "GBUY", secretKey: "SBUY" },
@@ -48,6 +51,23 @@ const sample: ProfileState = {
 function writeState(state: ProfileState = sample): void {
   mkdirSync(STATE_DIR, { recursive: true });
   writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), { mode: 0o600 });
+}
+
+function encryptedBackup(plaintext: string): string {
+  const salt = randomBytes(16);
+  const nonce = randomBytes(12);
+  const key = scryptSync(PASS, salt, 32, {
+    N: 1 << 14,
+    r: 8,
+    p: 1,
+    maxmem: 64 * 1024 * 1024,
+  });
+  const cipher = createCipheriv("aes-256-gcm", key, nonce);
+  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  return `v1:${salt.toString("base64")}:${nonce.toString("base64")}:${Buffer.concat([
+    encrypted,
+    cipher.getAuthTag(),
+  ]).toString("base64")}`;
 }
 
 describe("stateBackup", () => {
@@ -145,9 +165,9 @@ describe("stateBackup", () => {
   it("restore rejects tampered blob without calling write", () => {
     const blob = exportState(PASS);
     const parts = blob.split(":");
-    // flip last char of ciphertext
-    const last = parts[3];
-    const flipped = last.slice(0, -1) + (last.endsWith("A") ? "B" : "A");
+    // Change a full byte; the trailing base64 character may contain only padding bits.
+    const payload = parts[3];
+    const flipped = (payload[0] === "A" ? "B" : "A") + payload.slice(1);
     const tampered = `${parts[0]}:${parts[1]}:${parts[2]}:${flipped}`;
     let wrote = false;
     expect(() =>
@@ -163,11 +183,91 @@ describe("stateBackup", () => {
     expect(() => restoreState("v2:a:b:c", PASS, () => {})).toThrow(/Invalid backup format/);
   });
 
+  it("rejects duplicate or conflicting profile identifiers before writing", () => {
+    const duplicateProfile = encryptedBackup(
+      '{"version":1,"activeProfile":"one","profiles":{"one":{},"one":{}}}',
+    );
+    const conflictingWallets = encryptedBackup(
+      '{"version":1,"activeProfile":"one","profiles":{"one":{"wallet":{"publicKey":"GSHARED","secretKey":"S1"}},' +
+        '"two":{"wallet":{"publicKey":"GSHARED","secretKey":"S2"}}}}',
+    );
+    const write = vi.fn();
+    expect(() => restoreState(duplicateProfile, PASS, write)).toThrow(/not valid state/);
+    expect(() => restoreState(conflictingWallets, PASS, write)).toThrow(
+      /profiles\.two\.wallet\.publicKey: conflicts with profile "one"/,
+    );
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("reports invalid imported fields before writing", () => {
+    const invalid = encryptedBackup(
+      '{"version":1,"activeProfile":"default","profiles":{"default":{"apiKey":12}}}',
+    );
+    const write = vi.fn();
+    expect(() => restoreState(invalid, PASS, write)).toThrow(/profiles\.default\.apiKey/);
+    expect(write).not.toHaveBeenCalled();
+  });
+
   it("readPersistedState returns normalized profiles", () => {
     const state = readPersistedState();
     expect(state.activeProfile).toBe("publisher");
     expect(state.profiles.publisher?.wallet?.secretKey).toBe("SSECRET");
     expect(state.profiles.buyer?.wallet?.publicKey).toBe("GBUY");
+  });
+});
+
+describe("selective state transfer", () => {
+  const source: ProfileState = {
+    version: STATE_VERSION,
+    activeProfile: "publisher",
+    profiles: {
+      publisher: {
+        wallet: { publicKey: "GPUB", secretKey: "SSECRET" },
+        apiKey: "publisher-secret",
+        network: "testnet",
+      },
+      buyer: { network: "mainnet" },
+    },
+  };
+
+  it("exports only versioned profile names and network preferences", () => {
+    const blob = exportSelectiveState(source);
+    const parsed = JSON.parse(blob);
+    expect(parsed).toEqual({
+      version: 1,
+      activeProfile: "publisher",
+      profiles: { buyer: { network: "mainnet" }, publisher: { network: "testnet" } },
+    });
+    expect(blob).not.toContain("SSECRET");
+    expect(blob).not.toContain("publisher-secret");
+    expect(blob).not.toContain("GPUB");
+  });
+
+  it("merges selective preferences without replacing destination credentials", () => {
+    const destination: ProfileState = {
+      version: STATE_VERSION,
+      activeProfile: "default",
+      profiles: {
+        publisher: {
+          wallet: { publicKey: "GDEST", secretKey: "SDEST" },
+          apiKey: "destination-api-key",
+        },
+      },
+    };
+    const imported = importSelectiveState(exportSelectiveState(source), destination);
+    expect(imported.activeProfile).toBe("publisher");
+    expect(imported.profiles.publisher).toEqual({
+      wallet: { publicKey: "GDEST", secretKey: "SDEST" },
+      apiKey: "destination-api-key",
+      network: "testnet",
+    });
+    expect(imported.profiles.buyer).toEqual({ network: "mainnet" });
+  });
+
+  it("rejects duplicate JSON fields in a selective import", () => {
+    const duplicate =
+      '{"version":1,"activeProfile":"default","profiles":{"default":{},"default":{}}}';
+    expect(() => importSelectiveState(duplicate, source)).toThrow(/duplicate fields/);
   });
 });
 

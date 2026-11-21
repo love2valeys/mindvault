@@ -64,6 +64,7 @@ const VALID_CALLS: Record<string, Record<string, unknown>> = {
   mindvault_register_onchain: { resourceId: "res-001" },
   mindvault_agent_status: {},
   mindvault_registry_info: {},
+  mindvault_contract_preflight: {},
   mindvault_terms: {
     operation: "get",
     creator: "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH",
@@ -79,10 +80,15 @@ const VALID_CALLS: Record<string, Record<string, unknown>> = {
   mindvault_registry_list: {},
   mindvault_registry_count: {},
   mindvault_compare_catalogs: { left: "testnet", right: "mainnet" },
-  mindvault_registry_count: {},
   mindvault_tx_status: { txHash: VALID_SHA256 },
   mindvault_reset: {},
   mindvault_backup_state: { passphrase: "correct-horse" },
+  mindvault_preview_state_migration: {},
+  mindvault_apply_state_migration: {},
+  mindvault_export_state_selective: {},
+  mindvault_import_state_selective: {
+    blob: '{"version":1,"activeProfile":"default","profiles":{"default":{}}}',
+  },
   mindvault_resource_provenance: { resourceId: "res-001" },
   mindvault_resource_change_log: { resourceId: "res-001" },
   mindvault_restore_state: { blob: "v1:abc", passphrase: "correct-horse" },
@@ -317,6 +323,20 @@ describe("string arguments", () => {
     expect(err.issues[0].field).toBe("walletAddress");
   });
 
+  it("rejects a Stellar-shaped address with an invalid checksum before dispatch", () => {
+    const invalidAddress = `G${"A".repeat(55)}`;
+    const err = expectInvalid("mindvault_register", {
+      name: "A",
+      email: "a@b.co",
+      walletAddress: invalidAddress,
+    });
+    expect(err.issues[0]).toMatchObject({
+      field: "walletAddress",
+      code: "pattern_mismatch",
+      message: "walletAddress is not a valid Stellar public address.",
+    });
+  });
+
   it("rejects a non-http externalUrl", () => {
     const err = expectInvalid("mindvault_publish", {
       title: "T",
@@ -392,6 +412,47 @@ describe("flag arguments", () => {
     const err = expectInvalid("mindvault_metrics", { reset: "maybe" });
     expect(err.issues[0].code).toBe("wrong_type");
     expect(err.message).toContain("boolean");
+  });
+
+  it("codifies mindvault_reset confirm against resetGuard's allow-list and rejects 'on'/'off' (#221)", () => {
+    for (const value of [true, 1, "true", "TRUE", "1", " yes "]) {
+      expect(flag(validateToolArgs("mindvault_reset", { confirm: value }), "confirm")).toBe(true);
+    }
+    for (const value of [false, 0, "false", "0", "no"]) {
+      expect(flag(validateToolArgs("mindvault_reset", { confirm: value }), "confirm")).toBe(false);
+    }
+    for (const widened of ["on", "off", "y", "ok", "confirm", "sure", "enabled"]) {
+      const err = expectInvalid("mindvault_reset", { confirm: widened });
+      expect(err.issues[0].code).toBe("wrong_type");
+      expect(err.message).toContain("allowed strings: true, 1, yes, false, 0, no");
+      expect(err.message).not.toContain(`"${widened}"`);
+    }
+    // Same codified vocabulary applies to backup and state-migration confirm flags.
+    expectInvalid("mindvault_backup_state", { passphrase: "correct-horse", confirm: "on" });
+    expectInvalid("mindvault_apply_state_migration", { confirm: "on" });
+  });
+});
+
+describe("ownership transfer handoff arguments (#249)", () => {
+  it("accepts optional terms handoff and attestation reset fields", () => {
+    const args = validateToolArgs("mindvault_transfer_ownership", {
+      resourceId: "res-001",
+      newCreator: "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH",
+      newTermsHash: "sha256:0123456789abcdef",
+      resetAttestation: "true",
+    });
+
+    expect(optionalString(args, "newTermsHash")).toBe("sha256:0123456789abcdef");
+    expect(flag(args, "resetAttestation")).toBe(true);
+  });
+
+  it("rejects a terms hash longer than the contract limit", () => {
+    const err = expectInvalid("mindvault_transfer_ownership", {
+      resourceId: "res-001",
+      newCreator: "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH",
+      newTermsHash: "a".repeat(65),
+    });
+    expect(err.message).toContain("at most 64");
   });
 });
 
@@ -594,10 +655,10 @@ describe("catalog filter arguments", () => {
     expect(err.issues[0].message).toContain("sort");
   });
 
-  it("browse and search validate against the same argument names", () => {
-    expect(Object.keys(TOOL_ARGUMENT_SPECS.mindvault_browse).sort()).toEqual(
-      Object.keys(TOOL_ARGUMENT_SPECS.mindvault_search).sort(),
-    );
+  it("browse adds its cursor argument to the shared search filters", () => {
+    const browseArgs = Object.keys(TOOL_ARGUMENT_SPECS.mindvault_browse).sort();
+    const searchArgs = Object.keys(TOOL_ARGUMENT_SPECS.mindvault_search).sort();
+    expect(browseArgs).toEqual([...searchArgs, "cursor"].sort());
   });
 });
 

@@ -9,6 +9,9 @@
  * unit-testable; index.ts gathers the live balances and price and calls in.
  */
 
+import { checkAutoPaymentCeiling } from "./paymentCeiling.js";
+import { stroopsToUsdc, trimUsdc, usdcToStroops } from "./usdcAmount.js";
+
 /** Recommended minimum native XLM to cover the base reserve plus transaction fees. */
 export const MIN_NATIVE_XLM = 0.5;
 
@@ -31,6 +34,10 @@ export interface PaymentPreflightInput {
   network: string;
   /** Human label for what is being paid for (resource title, "content verification"). */
   label?: string;
+  /** Optional per-call ceiling override, mirroring mindvault_buy's maxAutoPayUsdc. */
+  maxAutoPayUsdc?: string;
+  /** Optional environment override for MINDVAULT_MAX_AUTO_PAY_USDC resolution. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface PaymentPreflightResult {
@@ -42,6 +49,8 @@ export interface PaymentPreflightResult {
   expectedAmount: string | null;
   usdcBalance: string;
   nativeXlmBalance: string;
+  /** Effective automatic payment ceiling for buy operations, or null when not applicable. */
+  autoPayCeiling: string | null;
   /** True when the wallet appears able to complete the payment. */
   ready: boolean;
   warnings: string[];
@@ -59,9 +68,26 @@ function trimAmount(n: number): string {
   return n.toFixed(7).replace(/\.?0+$/, "");
 }
 
+function toUsdcStroops(value: string | number | null | undefined): bigint | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value < 0) return null;
+    return usdcToStroops(trimAmount(value));
+  }
+  return usdcToStroops(value);
+}
+
+function formatStroops(stroops: bigint): string {
+  return trimUsdc(stroopsToUsdc(stroops));
+}
+
 /**
  * Estimate readiness for a payment. Never throws — every missing or malformed
  * input becomes a warning so the report is always safe to surface to an agent.
+ *
+ * Uses exact 7-decimal stroop math and the same automatic-payment ceiling
+ * evaluator as the live payment path (`checkAutoPaymentCeiling`), so casual and
+ * near-limit buys agree between preflight/dry-run and live execution.
  */
 export function buildPaymentPreflight(input: PaymentPreflightInput): PaymentPreflightResult {
   const warnings: string[] = [];
@@ -72,22 +98,39 @@ export function buildPaymentPreflight(input: PaymentPreflightInput): PaymentPref
     ready = false;
   }
 
-  const expected = toNumber(input.expectedAmount);
-  const usdc = toNumber(input.usdcBalance) ?? 0;
+  const expectedStroops = toUsdcStroops(input.expectedAmount);
+  const usdcStroops = toUsdcStroops(input.usdcBalance) ?? 0n;
   const native = toNumber(input.nativeBalance) ?? 0;
 
-  if (expected === null) {
+  const expectedDisplay = expectedStroops !== null ? formatStroops(expectedStroops) : null;
+  const usdcDisplay = formatStroops(usdcStroops);
+
+  if (expectedStroops === null) {
     warnings.push(
       "Expected amount could not be determined (resource price or verification fee unavailable). " +
         "Readiness for the USDC amount is unconfirmed.",
     );
     ready = false;
-  } else if (usdc < expected) {
+  } else if (usdcStroops < expectedStroops) {
     warnings.push(
-      `Insufficient USDC: need ${trimAmount(expected)}, have ${trimAmount(usdc)} ` +
-        `(shortfall ${trimAmount(expected - usdc)}). Fund the wallet and retry.`,
+      `Insufficient USDC: need ${expectedDisplay}, have ${usdcDisplay} ` +
+        `(shortfall ${formatStroops(expectedStroops - usdcStroops)}). Fund the wallet and retry.`,
     );
     ready = false;
+  }
+
+  let autoPayCeiling: string | null = null;
+  if (input.operation === "buy" && expectedDisplay !== null) {
+    const ceilingCheck = checkAutoPaymentCeiling({
+      price: expectedDisplay,
+      maxAutoPayUsdc: input.maxAutoPayUsdc,
+      env: input.env,
+    });
+    autoPayCeiling = ceilingCheck.ceiling;
+    if (!ceilingCheck.allowed) {
+      warnings.push(ceilingCheck.message);
+      ready = false;
+    }
   }
 
   if (native <= 0) {
@@ -105,8 +148,8 @@ export function buildPaymentPreflight(input: PaymentPreflightInput): PaymentPref
   }
 
   const summary = ready
-    ? `Ready to ${input.operation}: wallet has ${trimAmount(usdc)} USDC for the ` +
-      `${expected !== null ? trimAmount(expected) : "?"} USDC payment, plus XLM for fees.`
+    ? `Ready to ${input.operation}: wallet has ${usdcDisplay} USDC for the ` +
+      `${expectedDisplay ?? "?"} USDC payment, plus XLM for fees.`
     : `Not ready to ${input.operation}. See warnings.`;
 
   return {
@@ -115,9 +158,10 @@ export function buildPaymentPreflight(input: PaymentPreflightInput): PaymentPref
     paymentPath: `x402 exact payment in USDC on ${input.network}`,
     wallet: input.walletPublicKey,
     label: input.label ?? null,
-    expectedAmount: expected !== null ? trimAmount(expected) : null,
-    usdcBalance: trimAmount(usdc),
+    expectedAmount: expectedDisplay,
+    usdcBalance: usdcDisplay,
     nativeXlmBalance: trimAmount(native),
+    autoPayCeiling,
     ready,
     warnings,
     summary,
@@ -138,9 +182,10 @@ export function assertMinimumBalance(input: {
   operation: string;
   requiredUsdc?: string;
 }): string | null {
-  const usdc = parseFloat(input.usdcBalance) || 0;
+  const usdcStroops = usdcToStroops(input.usdcBalance, { allowNegative: true }) ?? 0n;
   const native = parseFloat(input.nativeBalance) || 0;
-  const required = input.requiredUsdc ? parseFloat(input.requiredUsdc) || 0 : 0;
+  const requiredStroops = input.requiredUsdc ? (usdcToStroops(input.requiredUsdc) ?? 0n) : 0n;
+  const minUsdcStroops = usdcToStroops(String(MIN_USDC_BALANCE)) ?? 0n;
 
   if (native < MIN_NATIVE_XLM) {
     return [
@@ -151,21 +196,21 @@ export function assertMinimumBalance(input: {
     ].join("\n");
   }
 
-  if (usdc < MIN_USDC_BALANCE) {
+  if (usdcStroops < minUsdcStroops) {
     return [
       `Insufficient USDC to ${input.operation}.`,
-      `Current USDC balance: ${trimAmount(usdc)}`,
+      `Current USDC balance: ${formatStroops(usdcStroops)}`,
       `Required minimum: ${MIN_USDC_BALANCE} USDC`,
       `Fund the wallet with USDC and retry.`,
     ].join("\n");
   }
 
-  if (required > 0 && usdc < required) {
+  if (requiredStroops > 0n && usdcStroops < requiredStroops) {
     return [
       `Insufficient USDC to ${input.operation}.`,
-      `Amount needed: ${trimAmount(required)} USDC`,
-      `Current balance: ${trimAmount(usdc)} USDC`,
-      `Shortfall: ${trimAmount(required - usdc)} USDC`,
+      `Amount needed: ${formatStroops(requiredStroops)} USDC`,
+      `Current balance: ${formatStroops(usdcStroops)} USDC`,
+      `Shortfall: ${formatStroops(requiredStroops - usdcStroops)} USDC`,
       `Fund the wallet with the shortfall and retry.`,
     ].join("\n");
   }

@@ -95,8 +95,26 @@ https://rpc-a.example → https://rpc-b.example [cooling down] (cooldown=30000ms
 - Two endpoints behind the same provider fail together. Prefer independent
   operators.
 
+## Horizon balance fallback and USDC units
+
+When a balance check falls back from Soroban RPC to Horizon after every
+configured Soroban endpoint fails, use `RpcFailover.runBalanceWithHorizonFallback`:
+
+- Soroban readings enter as `{ source: "soroban", stroops: bigint, decimals?: number }`
+  (defaulting to Stellar's 7 decimals; 6-decimal readings are scaled cleanly by
+  `10n` to 7-decimal stroops).
+- Horizon fallback readings enter as `{ source: "horizon", balance: string }`
+  (decimal USDC strings such as `"12.5000000"`).
+- Both paths pass through `normalizeUsdcBalanceToStroops` in
+  [`mcp/src/usdcAmount.ts`](../mcp/src/usdcAmount.ts), returning identical
+  canonical `{ usdc, stroops }` values so a failed primary RPC never silently
+  flips balance units by 10x or 10<sup>7</sup>x.
+- Non-failover errors (such as a `SyntaxError` or HTTP 400) are rethrown
+  immediately rather than falling back, and malformed balance responses throw
+  instead of returning a silent zero.
+
 ## Coverage
 
 - [`mcp/src/rpcFailover.test.ts`](../mcp/src/rpcFailover.test.ts) — endpoint
-  parsing, failure classification, cooldown behaviour, and attempt ordering
-  against a controllable clock
+  parsing, failure classification, cooldown behaviour, attempt ordering against
+  a controllable clock, and Soroban→Horizon balance fallback unit normalization

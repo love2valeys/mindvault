@@ -18,6 +18,7 @@
 import { redactSecrets } from "./diagnostics.js";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 
 // ── SDK version helpers ───────────────────────────────────────────────────────
 
@@ -54,9 +55,24 @@ export function readInstalledSdkVersion(
   const jsonPath = resolver("@modelcontextprotocol/sdk/package.json");
   if (!jsonPath) return null;
   try {
-    const raw = readFileSync(jsonPath, "utf-8");
-    const pkg = JSON.parse(raw) as { version?: unknown };
-    return typeof pkg.version === "string" ? pkg.version : null;
+    let raw = readFileSync(jsonPath, "utf-8");
+    let pkg = JSON.parse(raw) as { name?: unknown; version?: unknown };
+    if (typeof pkg.version === "string") return pkg.version;
+    let dir = dirname(jsonPath);
+    while (dir && dir !== dirname(dir)) {
+      dir = dirname(dir);
+      try {
+        const candidate = join(dir, "package.json");
+        raw = readFileSync(candidate, "utf-8");
+        pkg = JSON.parse(raw) as { name?: unknown; version?: unknown };
+        if (pkg.name === "@modelcontextprotocol/sdk" && typeof pkg.version === "string") {
+          return pkg.version;
+        }
+      } catch {
+        // continue
+      }
+    }
+    return null;
   } catch {
     return null;
   }

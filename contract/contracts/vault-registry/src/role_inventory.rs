@@ -67,6 +67,7 @@ pub(crate) fn track_grant(env: &Env, role: RoleKind, who: &Address) -> Result<()
     env.storage()
         .instance()
         .set(&RoleIndexKey::Members(role), &list);
+    crate::VaultRegistry::bump_instance(env);
     Ok(())
 }
 
@@ -78,6 +79,7 @@ pub(crate) fn track_revoke(env: &Env, role: RoleKind, who: &Address) {
         env.storage()
             .instance()
             .set(&RoleIndexKey::Members(role), &list);
+        crate::VaultRegistry::bump_instance(env);
     }
 }
 

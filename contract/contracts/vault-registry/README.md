@@ -11,16 +11,17 @@ see [`contract/README.md`](../../README.md).
 
 ## Constants quick-reference
 
-| Symbol              | Value                                                      | Notes                                                  |
-| ------------------- | ---------------------------------------------------------- | ------------------------------------------------------ |
-| Testnet contract ID | `CDQKUIADLO5S5WEHEUTTXX2M45WAHVRU2PBEBD6ZGDKMOP5A72FJ3OD4` | Soroban testnet                                        |
-| Soroban RPC         | `https://soroban-testnet.stellar.org`                      |                                                        |
-| 1 USDC              | `10_000_000` base units                                    | `price` field uses 7 decimal places                    |
-| 0.10 USDC           | `1_000_000` base units                                     |                                                        |
-| Max price           | `1_000_000_000_000_000_000` base units                     | 100 billion USDC (10^18 units at 7 decimals)           |
-| Max metadata        | 512 bytes                                                  | Must start with a supported prefix (see below)         |
-| Max tags            | 8                                                          | Each max 32 bytes, normalized to lowercase ASCII       |
-| Max top tags        | 20                                                         | `top_tags` response cap; counts saturate at `u32::MAX` |
+| Symbol               | Value                                                      | Notes                                                  |
+| -------------------- | ---------------------------------------------------------- | ------------------------------------------------------ |
+| Testnet contract ID  | `CDQKUIADLO5S5WEHEUTTXX2M45WAHVRU2PBEBD6ZGDKMOP5A72FJ3OD4` | Soroban testnet                                        |
+| Soroban RPC          | `https://soroban-testnet.stellar.org`                      |                                                        |
+| 1 USDC               | `10_000_000` base units                                    | `price` field uses 7 decimal places                    |
+| 0.10 USDC            | `1_000_000` base units                                     |                                                        |
+| Max price            | `1_000_000_000_000_000_000` base units                     | 100 billion USDC (10^18 units at 7 decimals)           |
+| Max metadata         | 512 bytes                                                  | Must start with a supported prefix (see below)         |
+| Max metadata mirrors | 4                                                          | `MAX_METADATA_POINTERS` for `set_metadata_pointers`    |
+| Max tags             | 8                                                          | Each max 32 bytes, normalized to lowercase ASCII       |
+| Max top tags         | 20                                                         | `top_tags` response cap; counts saturate at `u32::MAX` |
 
 **Metadata pointer prefixes accepted:** `ipfs://`, `ar://`, `https://`,
 `http://`, `sha256:`, `sha-256:`, `0x`.
@@ -138,6 +139,47 @@ network's `max_entry_ttl` setting — a bump beyond that ceiling is rejected by
 the host, so the contract would stop accepting writes entirely. Change them
 together, and re-run `cargo test` in `contract/`: the TTL tests assert the
 observed on-ledger TTL against these constants.
+
+### Resource lifecycle state machine
+
+New resources begin in `Listed`. `freeze_resource` freezes activity but keeps
+metadata, price, tags, and ownership mutable unless the separate
+`freeze_metadata` path has also been used.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Listed
+    Listed --> Delisted: creator
+    Delisted --> Listed: creator
+    Listed --> Frozen: creator
+    Delisted --> Frozen: creator
+    Listed --> Disputed: admin
+    Delisted --> Disputed: admin
+    Frozen --> Listed: creator reactivate
+    Frozen --> Disputed: admin
+    Listed --> Tombstoned: admin
+    Delisted --> Tombstoned: admin
+    Frozen --> Tombstoned: admin
+    Disputed --> Listed: admin resolve
+    Disputed --> Delisted: admin resolve
+    Disputed --> Frozen: admin resolve
+    Disputed --> Tombstoned: admin
+```
+
+Use the transition matrix below rather than treating arrows as unrestricted
+moves. The exact admin and creator permissions are enforced on-chain.
+
+| Current state | `Listed`                          | `Delisted`                    | `Frozen`                      | `Disputed`               | `Tombstoned`                   |
+| ------------- | --------------------------------- | ----------------------------- | ----------------------------- | ------------------------ | ------------------------------ |
+| `Listed`      | no-op via `set_listed(true)`      | creator                       | creator via `freeze_resource` | admin via `open_dispute` | admin via `tombstone_resource` |
+| `Delisted`    | creator via `set_listed(true)`    | no-op via `set_listed(false)` | creator via `freeze_resource` | admin via `open_dispute` | admin via `tombstone_resource` |
+| `Frozen`      | creator via `reactivate_resource` | no                            | no                            | admin via `open_dispute` | admin via `tombstone_resource` |
+| `Disputed`    | admin via `resolve_dispute`       | admin via `resolve_dispute`   | admin via `resolve_dispute`   | no                       | admin via `tombstone_resource` |
+| `Tombstoned`  | no                                | no                            | no                            | no                       | terminal                       |
+
+`resolve_dispute` may return a disputed resource to `Listed`, `Delisted`, or
+`Frozen`. `Tombstoned` has no exit transition and the same resource id cannot
+be registered again.
 
 ---
 
@@ -305,16 +347,42 @@ stellar contract invoke \
   --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
   -- list_by_dispute_status --flagged true --start 0 --limit 20
 
+# Check only whether a resource currently carries a dispute flag
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  -- is_flagged --id swcn98besxpp6t1u8e77fqz3
+
 # One resource's moderation state: dispute flag, reason hash, last moderator
 stellar contract invoke \
   --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
   -- flag_details --id swcn98besxpp6t1u8e77fqz3
+
+# All metadata pointers and preferred primary index (falls back to [metadata], primary 0)
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  -- get_metadata_pointers --id swcn98besxpp6t1u8e77fqz3
 
 # How many resources does a creator currently own?
 stellar contract invoke \
   --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
   -- creator_resource_count \
   --creator GB6LGS25QN3DFNXKFWCTKB3FMKZFLW7OIKCX6HJKKIEPV3H2JJKBIMHV
+
+# How many of a creator's resources are currently Listed?
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  -- creator_listed_count \
+  --creator GB6LGS25QN3DFNXKFWCTKB3FMKZFLW7OIKCX6HJKKIEPV3H2JJKBIMHV
+
+# Resources by verification status (Pending, Verified, Rejected, or Revoked)
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  -- list_by_verification_status --status Pending --cursor 0 --limit 20
+
+# Chronological status-change history recorded by a verifier
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  -- get_verifier_status_history --verifier GDVERIFIER... --cursor 0 --limit 20
 ```
 
 ### Writing (requires a funded identity and network fees)
@@ -331,6 +399,22 @@ stellar contract invoke \
   --metadata 'ipfs://QmYwAPJzv5CZsnAzt8auV39tMVyQ4cZ3QqcSBuKkP3jRq8' \
   --tags '["dataset","research"]'
 
+# Register with an immutable metadata/content hash binding
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  --source my-identity \
+  -- register_with_hash \
+  --creator $(stellar keys address my-identity) \
+  --id swcn98besxpp6t1u8e77fqz3 \
+  --price 10000000 \
+  --metadata 'ipfs://QmYwAPJzv5CZsnAzt8auV39tMVyQ4cZ3QqcSBuKkP3jRq8' \
+  --tags '["dataset","research"]' \
+  --content-hash 'sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08'
+
+# Omitting content_hash (the generated SDK represents this as None) preserves
+# the legacy mutable-metadata behavior; supplying it permanently freezes the
+# metadata pointer against update_metadata and set_metadata_pointers.
+
 # Update the price to 0.50 USDC (5_000_000 base units)
 stellar contract invoke \
   --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
@@ -346,6 +430,27 @@ stellar contract invoke \
   -- update_metadata \
   --id swcn98besxpp6t1u8e77fqz3 \
   --metadata 'ipfs://QmNewHash'
+
+# Publish redundant multi-scheme metadata mirrors (IPFS + Arweave + hosted HTTPS)
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  --source my-identity \
+  -- set_metadata_pointers \
+  --id swcn98besxpp6t1u8e77fqz3 \
+  --pointers '["ipfs://QmNewHash","ar://arweaveTxId","https://cdn.example.org/vault/item.json"]' \
+  --primary 0
+
+# Retry-safe payment recording (returns existing receipt on identical retry)
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  --source settler-identity \
+  -- record_payment_idempotent \
+  --settler $(stellar keys address settler-identity) \
+  --receipt_id rcpt-001 \
+  --resource_id swcn98besxpp6t1u8e77fqz3 \
+  --payer GB6LGS25QN3DFNXKFWCTKB3FMKZFLW7OIKCX6HJKKIEPV3H2JJKBIMHV \
+  --amount 5000000 \
+  --tx_hash 0xsettlementtxhash
 
 # Replace discovery tags
 stellar contract invoke \
@@ -405,12 +510,27 @@ The very first `nominate_new_admin` call bootstraps the admin directly
 current admin to sign and the nominee must call `accept_admin`.
 
 ```bash
-# Bootstrap the initial admin (first-ever call — signed by new_admin)
+# Bootstrap the initial admin (single-key path — signed by new_admin)
 stellar contract invoke \
   --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
   --source platform-admin \
   -- nominate_new_admin \
   --new-admin $(stellar keys address platform-admin)
+
+# Optional 2-of-2 dual-key bootstrap (signed by BOTH admin and recovery-admin)
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  --source platform-admin \
+  -- bootstrap_dual_admin \
+  --admin $(stellar keys address platform-admin) \
+  --recovery-admin $(stellar keys address recovery-admin)
+
+# Transfer admin immediately if the primary admin key is lost (signed by recovery-admin)
+stellar contract invoke \
+  --id $CONTRACT --rpc-url $RPC --network-passphrase "Test SDF Network ; September 2015" \
+  --source recovery-admin \
+  -- recover_admin \
+  --new-admin GDNEWADMIN...
 
 # Rotate admin — nominate a successor (signed by current admin)
 stellar contract invoke \
@@ -570,9 +690,26 @@ const byTagTx = await registry.list_by_tag({
   limit: 20,
 });
 
-// How many resources does a creator currently own?
+// How many resources does a creator currently own, and how many are Listed?
 const countByCreatorTx = await registry.creator_resource_count({
   creator: "GB6LGS25QN3DFNXKFWCTKB3FMKZFLW7OIKCX6HJKKIEPV3H2JJKBIMHV",
+});
+const listedByCreatorTx = await registry.creator_listed_count({
+  creator: "GB6LGS25QN3DFNXKFWCTKB3FMKZFLW7OIKCX6HJKKIEPV3H2JJKBIMHV",
+});
+
+// Resources filtered by verification status (Pending / Verified / Rejected / Revoked)
+const pendingPageTx = await registry.list_by_verification_status({
+  status: { tag: "Pending", values: undefined },
+  cursor: 0,
+  limit: 20,
+});
+
+// Per-verifier chronological verification history
+const verifierHistoryTx = await registry.get_verifier_status_history({
+  verifier: "GDVERIFIER...",
+  cursor: 0,
+  limit: 20,
 });
 ```
 
@@ -592,6 +729,18 @@ const tx = await registry.register({
   tags: ["dataset", "research"], // 0–8 tags, each ≤ 32 bytes; normalized to lowercase
 });
 await tx.signAndSend();
+
+// Immutable metadata variant: a supplied content hash freezes the metadata
+// pointer at registration and rejects later pointer changes.
+const immutableTx = await registry.register_with_hash({
+  creator: "GB6LGS25QN3DFNXKFWCTKB3FMKZFLW7OIKCX6HJKKIEPV3H2JJKBIMHV",
+  id: "swcn98besxpp6t1u8e77fqz3",
+  price: ONE_USDC,
+  metadata: "ipfs://QmYwAPJzv5CZsnAzt8auV39tMVyQ4cZ3QqcSBuKkP3jRq8",
+  tags: ["dataset", "research"],
+  content_hash: "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+});
+await immutableTx.signAndSend();
 ```
 
 ### Mutation examples
@@ -640,6 +789,19 @@ await xferTx.signAndSend();
 
 In `src/test.rs` the SDK client is generated by `soroban-sdk` macros. The
 patterns below match the helpers defined at the top of the test file.
+
+For a transfer that also updates the incoming owner's terms or clears an
+existing attestation, use `transfer_ownership_with_terms`. Both optional
+actions are committed atomically with the ownership change:
+
+```rust
+client.transfer_ownership_with_terms(
+    &id,
+    &new_owner,
+    &Some(String::from_str(&env, "sha256:0123456789abcdef")),
+    &true,
+);
+```
 
 ```rust
 use soroban_sdk::{Env, Address, String, Vec};
@@ -719,6 +881,11 @@ let by_creator = client.list_by_creator(&creator, &0u32, &20u32);
 let by_tag = client.list_by_tag(&String::from_str(&env, "dataset"), &0u32, &20u32);
 
 let count = client.creator_resource_count(&creator);
+let listed_count = client.creator_listed_count(&creator);
+
+// Paginated verification status reads
+let verified_page = client.list_by_verification_status(&VerificationStatus::Verified, &0u32, &20u32);
+let history_page = client.get_verifier_status_history(&verifier, &0u32, &20u32);
 ```
 
 ### Ownership transfer
@@ -824,3 +991,12 @@ assert_eq!(
 cuid2 format used by the MindVault server. The following IDs are reserved and
 always rejected: `admin`, `null`, `registry`, `api`, `index`, `root`, `system`
 (case-insensitive).
+
+## Role Management Flows Summary
+
+| Role        | Grant / Nominate Entrypoint                               | Revoke / Rotate Entrypoint                                    | Read / Audit Query                                     |
+| :---------- | :-------------------------------------------------------- | :------------------------------------------------------------ | :----------------------------------------------------- |
+| `Admin`     | `nominate_new_admin(new_admin)` / `accept_admin(pending)` | `cancel_admin_nomination(admin)` / `recover_admin(new_admin)` | `admin()`, `pending_admin()`, `pending_admin_expiry()` |
+| `Verifier`  | `add_verifier(verifier)` / `add_verifiers(batch)`         | `remove_verifier(verifier)` / `rotate_verifier(old, new)`     | `is_verifier(addr)`, `list_verifiers()`                |
+| `Settler`   | `add_settler(settler)` / `set_payment_settler(settler)`   | `remove_settler(settler)` / `rotate_payment_settler(new)`     | `is_settler(addr)`, `payment_settler()`                |
+| `Moderator` | `add_moderator(admin, moderator)`                         | `remove_moderator(admin, moderator)`                          | `is_moderator(addr)`, `list_moderators()`              |

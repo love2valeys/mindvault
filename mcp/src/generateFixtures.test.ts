@@ -157,12 +157,20 @@ describe.skipIf(skipFileChecks)("generated fixture files", () => {
 
   it("horizon-balances.json contains a USDC and a native balance", () => {
     const fixture = loadFixture("horizon-balances.json") as {
-      balances: Array<{ asset_type: string; asset_code?: string; balance: string }>;
+      balances: Array<{
+        asset_type: string;
+        asset_code?: string;
+        asset_issuer?: string;
+        balance: string;
+      }>;
     };
     expect(Array.isArray(fixture.balances)).toBe(true);
     const usdc = fixture.balances.find((b) => b.asset_code === "USDC");
     const native = fixture.balances.find((b) => b.asset_type === "native");
     expect(usdc).toBeDefined();
+    expect(usdc?.asset_issuer).toBe(
+      "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+    );
     expect(native).toBeDefined();
   });
 

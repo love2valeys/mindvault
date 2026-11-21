@@ -22,7 +22,7 @@ export interface NetworkPreset {
   explorerNetwork: ExplorerNetwork;
   /** Soroban USDC Stellar Asset Contract (SEP-41) used by x402. */
   usdcSacContractId: string;
-  /** Classic USDC issuer for trustline setup scripts. */
+  /** Canonical classic USDC issuer used to identify Horizon trustlines. */
   usdcClassicIssuer: string;
   /**
    * Known vault-registry deployment for this network, if any.

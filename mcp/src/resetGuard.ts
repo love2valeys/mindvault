@@ -40,6 +40,55 @@ export const RESET_CONFIRM_STRINGS = Object.freeze(["true", "1", "yes"] as const
 export const RESET_CONFIRM_LITERALS = Object.freeze([true, 1] as const);
 
 /**
+ * The complete set of string spellings that explicitly decline a reset
+ * (keeping the call in non-destructive preview / echo mode).
+ */
+export const RESET_DECLINE_STRINGS = Object.freeze(["false", "0", "no"] as const);
+
+/** The non-string values that explicitly decline a reset. */
+export const RESET_DECLINE_LITERALS = Object.freeze([false, 0] as const);
+
+/** Outcome of validating a raw `confirm` argument against the codified reset vocabulary. */
+export type ResetConfirmValidation =
+  | { valid: true; confirmed: boolean }
+  | { valid: false; reason: string };
+
+/**
+ * Validate a `confirm` value against the exact codified reset vocabulary (#221).
+ *
+ * Unlike generic boolean flag coercion (which may accept `"on"`/`"off"` or be
+ * widened for reversible flags), reset confirmation only allows the frozen
+ * `RESET_CONFIRM_*` and `RESET_DECLINE_*` sets (plus `undefined`/`null` for
+ * preview/echo mode). Any other spelling is rejected rather than silently
+ * coerced.
+ */
+export function validateResetConfirm(value: unknown): ResetConfirmValidation {
+  if (value === undefined || value === null) {
+    return { valid: true, confirmed: false };
+  }
+  if (typeof value === "boolean" || typeof value === "number") {
+    if ((RESET_CONFIRM_LITERALS as readonly unknown[]).includes(value)) {
+      return { valid: true, confirmed: true };
+    }
+    if ((RESET_DECLINE_LITERALS as readonly unknown[]).includes(value)) {
+      return { valid: true, confirmed: false };
+    }
+  } else if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if ((RESET_CONFIRM_STRINGS as readonly string[]).includes(normalized)) {
+      return { valid: true, confirmed: true };
+    }
+    if ((RESET_DECLINE_STRINGS as readonly string[]).includes(normalized)) {
+      return { valid: true, confirmed: false };
+    }
+  }
+  return {
+    valid: false,
+    reason: `confirm must be a boolean (true/false) or one of the allowed strings: ${[...RESET_CONFIRM_STRINGS, ...RESET_DECLINE_STRINGS].join(", ")}.`,
+  };
+}
+
+/**
  * Whether a reset call carries explicit confirmation.
  *
  * The accepted vocabulary is spelled out here rather than delegated to the

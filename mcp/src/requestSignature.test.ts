@@ -208,6 +208,23 @@ describe("signMutatingHeaders", () => {
       }),
     );
   });
+
+  it("includes the query string in the signed path", () => {
+    const headers = signMutatingHeaders(
+      "https://api.example.com/resources/abc/register?page=2&sort=created",
+      "POST",
+      { "x-api-key": API_KEY },
+      undefined,
+      NOW_MS,
+    );
+    expect(headers["X-Signature"]).toBe(
+      expectedSignature({
+        method: "POST",
+        path: "/resources/abc/register?page=2&sort=created",
+        bodyHash: EMPTY_BODY_HASH,
+      }),
+    );
+  });
 });
 
 describe("isClockSkewRejection", () => {

@@ -2,9 +2,11 @@ import { describe, it, expect, vi } from "vitest";
 import {
   buildPublishStatusSnapshot,
   estimatePollSteps,
+  fetchPublishStatusPair,
   isVerificationSettled,
   normalizeIntervalMs,
   normalizeTimeoutMs,
+  normalizeVerificationStatus,
   normalizeWaitFlag,
   currentVerificationStatus,
   pollPublishStatus,
@@ -406,5 +408,92 @@ describe("pollPublishStatus stops at a terminal status under retry (#840)", () =
       "Verification pending — poll 1, still waiting.",
       "Verification rejected after 2 polls.",
     ]);
+  });
+
+  it("recognizes mixed-case terminal statuses like 'Rejected' without polling past them (#217)", async () => {
+    expect(normalizeVerificationStatus("Rejected")).toBe("rejected");
+    expect(normalizeVerificationStatus(" VERIFIED ")).toBe("verified");
+    expect(normalizeVerificationStatus("Skipped")).toBe("skipped");
+    expect(isVerificationSettled("Rejected")).toBe(true);
+
+    const { result, updates, fetchStatus } = await runPoll(["pending", "Rejected"], {
+      wait: true,
+      timeoutMs: 60_000,
+      intervalMs: 2_000,
+    });
+
+    expect(fetchStatus).toHaveBeenCalledTimes(2);
+    expect(result.attempts).toBe(2);
+    expect(result.timedOut).toBe(false);
+    expect(currentVerificationStatus(result.data)).toBe("rejected");
+    expect(updates.map((u) => u.message)).toEqual([
+      "Verification pending — poll 1, still waiting.",
+      "Verification rejected after 2 polls.",
+    ]);
+  });
+
+  it("prefers a terminal status on /meta over a stale pending on /verification (#217)", () => {
+    const data = publishStatusFromResponses(
+      "res-1",
+      metaWith("Rejected"),
+      verificationWith("pending"),
+    );
+    expect(currentVerificationStatus(data)).toBe("rejected");
+    const snap = buildPublishStatusSnapshot("res-1", data, {
+      polled: true,
+      attempts: 2,
+      timedOut: false,
+    });
+    expect(snap.verificationStatus).toBe("rejected");
+    expect(snap.settled).toBe(true);
+    expect(snap.message).toMatch(/rejected/i);
+  });
+
+  it("preserves a terminal status when the companion endpoint throws a transport error (#217)", async () => {
+    const fromMeta = await fetchPublishStatusPair(
+      "res-1",
+      async () => metaWith("rejected"),
+      async () => {
+        throw new Error("fetch failed");
+      },
+    );
+    expect(currentVerificationStatus(fromMeta)).toBe("rejected");
+    expect(fromMeta.verification).toBeNull();
+
+    const fromVerification = await fetchPublishStatusPair(
+      "res-1",
+      async () => {
+        throw new Error("ETIMEDOUT");
+      },
+      async () => verificationWith("Rejected"),
+    );
+    expect(currentVerificationStatus(fromVerification)).toBe("rejected");
+    expect(fromVerification.meta).toBeNull();
+  });
+
+  it("propagates transport errors when neither endpoint is terminal, and aborts immediately (#217)", async () => {
+    await expect(
+      fetchPublishStatusPair(
+        "res-1",
+        async () => metaWith("pending"),
+        async () => {
+          throw new Error("fetch failed");
+        },
+      ),
+    ).rejects.toThrow(/fetch failed/);
+
+    const fetchVerification = vi.fn(async () => verificationWith("rejected"));
+    const abort = new Error("aborted");
+    abort.name = "AbortError";
+    await expect(
+      fetchPublishStatusPair(
+        "res-1",
+        async () => {
+          throw abort;
+        },
+        fetchVerification,
+      ),
+    ).rejects.toThrow(abort);
+    expect(fetchVerification).not.toHaveBeenCalled();
   });
 });

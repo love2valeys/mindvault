@@ -93,6 +93,11 @@ await withNewCorrelationId(async (id) => {
 });
 ```
 
+Catalog cache pre-warming does this automatically when it runs outside a tool
+call: its outbound catalog request and audit entries share a newly minted
+correlation ID. When pre-warming is triggered by a tool call, it keeps that
+call's existing ID.
+
 ## Coverage
 
 - [`mcp/src/correlation.test.ts`](../mcp/src/correlation.test.ts) — ID format

@@ -71,3 +71,7 @@ register flow uses) and is **best-effort**:
 | Server   | `DELETE /resources/:id` → `listed = false`             | Implemented        |
 | Server   | `delistResource` → on-chain `delist(id)` (best-effort) | Implemented (#218) |
 | Server   | Event listener syncs on-chain → DB                     | Issue #90          |
+
+## Emergency Delist Event Payload (`emdelist`)
+
+`emergency_delist(id, admin, reason)` publishes topic `("emdelist", id)` with an explicit `EmergencyDelistEvent { id, admin, reason }` payload so off-chain indexers can distinguish emergency moderation delist reasons from creator-initiated `delist` events.

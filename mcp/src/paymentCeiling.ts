@@ -17,15 +17,122 @@ export const DEFAULT_MAX_AUTO_FEE_STROOPS = "100000";
  */
 const toStroops = (value: string): bigint | null => usdcToStroops(value);
 
-function configuredCeiling(env: NodeJS.ProcessEnv): { value: string; stroops: bigint } {
-  const value = env.MINDVAULT_MAX_AUTO_PAY_USDC ?? DEFAULT_MAX_AUTO_PAY_USDC;
+export interface ResolvedAutoPaymentCeiling {
+  value: string;
+  stroops: bigint;
+  isDefault: boolean;
+}
+
+/**
+ * Resolve the effective automatic payment ceiling from the environment.
+ *
+ * Unset or blank (`""` / whitespace-only) `MINDVAULT_MAX_AUTO_PAY_USDC` falls
+ * back to {@link DEFAULT_MAX_AUTO_PAY_USDC} so an empty `.env` placeholder
+ * behaves identically to an unset variable rather than failing preflight or
+ * live buys.
+ */
+export function resolveAutoPaymentCeiling(
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedAutoPaymentCeiling {
+  const raw = env.MINDVAULT_MAX_AUTO_PAY_USDC?.trim();
+  const isDefault = !raw;
+  const value = raw || DEFAULT_MAX_AUTO_PAY_USDC;
   const stroops = toStroops(value);
   if (stroops === null) {
     throw new Error(
       "MINDVAULT_MAX_AUTO_PAY_USDC must be a non-negative USDC decimal with at most 7 decimal places.",
     );
   }
-  return { value, stroops };
+  return { value, stroops, isDefault };
+}
+
+export type AutoPaymentCeilingCheck =
+  | {
+      allowed: true;
+      ceiling: string;
+      isDefaultCeiling: boolean;
+    }
+  | {
+      allowed: false;
+      reason: "invalid_price" | "invalid_ceiling" | "invalid_override" | "exceeds_ceiling";
+      message: string;
+      ceiling: string | null;
+      isDefaultCeiling: boolean;
+    };
+
+/**
+ * Pure, non-throwing ceiling evaluator shared by payment preflight and live
+ * `mindvault_buy` / `mindvault_buy_lease` guards so dry-run / preflight and
+ * live payment decisions cannot drift.
+ */
+export function checkAutoPaymentCeiling(input: {
+  price: unknown;
+  maxAutoPayUsdc?: string;
+  env?: NodeJS.ProcessEnv;
+}): AutoPaymentCeilingCheck {
+  const requiredAmount = typeof input.price === "string" ? input.price : String(input.price ?? "");
+  const requiredStroops = toStroops(requiredAmount);
+  if (requiredStroops === null) {
+    return {
+      allowed: false,
+      reason: "invalid_price",
+      message:
+        "Automatic payment blocked because the resource price is missing or invalid; no x402 payment was submitted.",
+      ceiling: null,
+      isDefaultCeiling: false,
+    };
+  }
+
+  let ceiling: ResolvedAutoPaymentCeiling;
+  try {
+    ceiling = resolveAutoPaymentCeiling(input.env ?? process.env);
+  } catch (err) {
+    return {
+      allowed: false,
+      reason: "invalid_ceiling",
+      message: (err as Error).message,
+      ceiling: null,
+      isDefaultCeiling: false,
+    };
+  }
+
+  if (requiredStroops <= ceiling.stroops) {
+    return {
+      allowed: true,
+      ceiling: ceiling.value,
+      isDefaultCeiling: ceiling.isDefault,
+    };
+  }
+
+  const overrideStroops =
+    input.maxAutoPayUsdc === undefined ? null : toStroops(input.maxAutoPayUsdc);
+  if (input.maxAutoPayUsdc !== undefined && overrideStroops === null) {
+    return {
+      allowed: false,
+      reason: "invalid_override",
+      message:
+        "maxAutoPayUsdc must be a non-negative USDC decimal with at most 7 decimal places.",
+      ceiling: ceiling.value,
+      isDefaultCeiling: ceiling.isDefault,
+    };
+  }
+  if (overrideStroops !== null && overrideStroops >= requiredStroops) {
+    return {
+      allowed: true,
+      ceiling: ceiling.value,
+      isDefaultCeiling: ceiling.isDefault,
+    };
+  }
+
+  return {
+    allowed: false,
+    reason: "exceeds_ceiling",
+    message:
+      `Purchase requires ${requiredAmount} USDC, which exceeds the automatic payment ceiling of ${ceiling.value} USDC. ` +
+      `To authorize this purchase, call mindvault_buy with maxAutoPayUsdc: "${requiredAmount}" (or a higher amount).`,
+    ceiling: ceiling.value,
+    isDefaultCeiling: ceiling.isDefault,
+  };
 }
 
 /**
@@ -37,30 +144,10 @@ export function assertAutoPaymentWithinCeiling(input: {
   maxAutoPayUsdc?: string;
   env?: NodeJS.ProcessEnv;
 }): void {
-  const requiredAmount = typeof input.price === "string" ? input.price : String(input.price ?? "");
-  const requiredStroops = toStroops(requiredAmount);
-  if (requiredStroops === null) {
-    throw new Error(
-      "Automatic payment blocked because the resource price is missing or invalid; no x402 payment was submitted.",
-    );
+  const result = checkAutoPaymentCeiling(input);
+  if (!result.allowed) {
+    throw new Error(result.message);
   }
-
-  const ceiling = configuredCeiling(input.env ?? process.env);
-  if (requiredStroops <= ceiling.stroops) return;
-
-  const overrideStroops =
-    input.maxAutoPayUsdc === undefined ? null : toStroops(input.maxAutoPayUsdc);
-  if (input.maxAutoPayUsdc !== undefined && overrideStroops === null) {
-    throw new Error(
-      "maxAutoPayUsdc must be a non-negative USDC decimal with at most 7 decimal places.",
-    );
-  }
-  if (overrideStroops !== null && overrideStroops >= requiredStroops) return;
-
-  throw new Error(
-    `Purchase requires ${requiredAmount} USDC, which exceeds the automatic payment ceiling of ${ceiling.value} USDC. ` +
-      `To authorize this purchase, call mindvault_buy with maxAutoPayUsdc: "${requiredAmount}" (or a higher amount).`,
-  );
 }
 
 /** Bound sponsored Stellar transaction fees for registry mutations. */
@@ -68,10 +155,11 @@ export function assertTransactionFeeWithinCeiling(input: {
   feeStroops: string | number | bigint;
   env?: NodeJS.ProcessEnv;
 }): void {
-  const raw =
-    input.env?.MINDVAULT_MAX_AUTO_FEE_STROOPS ??
-    process.env.MINDVAULT_MAX_AUTO_FEE_STROOPS ??
-    DEFAULT_MAX_AUTO_FEE_STROOPS;
+  const configured =
+    input.env !== undefined
+      ? input.env.MINDVAULT_MAX_AUTO_FEE_STROOPS?.trim()
+      : process.env.MINDVAULT_MAX_AUTO_FEE_STROOPS?.trim();
+  const raw = configured || DEFAULT_MAX_AUTO_FEE_STROOPS;
   if (!/^\d+$/.test(raw))
     throw new Error("MINDVAULT_MAX_AUTO_FEE_STROOPS must be a non-negative integer.");
   const fee = BigInt(String(input.feeStroops));

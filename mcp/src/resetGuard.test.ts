@@ -11,6 +11,9 @@ import {
   isResetConfirmed,
   RESET_CONFIRM_LITERALS,
   RESET_CONFIRM_STRINGS,
+  RESET_DECLINE_LITERALS,
+  RESET_DECLINE_STRINGS,
+  validateResetConfirm,
   type ResetScope,
 } from "./resetGuard.js";
 import { isTruthyConfirm } from "./mainnetGuardrails.js";
@@ -99,6 +102,26 @@ describe("reset confirmation vocabulary (#836)", () => {
     // this asserts the direction of the relationship, not that they are equal.
     for (const value of ["true", "1", "yes", "TRUE", " yes "]) {
       if (isResetConfirmed(value)) expect(isTruthyConfirm(value), value).toBe(true);
+    }
+  });
+
+  it("codifies explicit decline values and rejects widened strings in validateResetConfirm (#221)", () => {
+    expect([...RESET_DECLINE_STRINGS]).toEqual(["false", "0", "no"]);
+    expect([...RESET_DECLINE_LITERALS]).toEqual([false, 0]);
+    expect(Object.isFrozen(RESET_DECLINE_STRINGS)).toBe(true);
+    expect(Object.isFrozen(RESET_DECLINE_LITERALS)).toBe(true);
+
+    expect(validateResetConfirm(undefined)).toEqual({ valid: true, confirmed: false });
+    expect(validateResetConfirm(null)).toEqual({ valid: true, confirmed: false });
+    for (const value of [true, 1, "true", "TRUE", " 1 ", "yes"]) {
+      expect(validateResetConfirm(value)).toEqual({ valid: true, confirmed: true });
+    }
+    for (const value of [false, 0, "false", "FALSE", "0", " no "]) {
+      expect(validateResetConfirm(value)).toEqual({ valid: true, confirmed: false });
+    }
+    for (const widened of ["on", "off", "y", "ok", "confirm", "sure", 2, {}]) {
+      const res = validateResetConfirm(widened);
+      expect(res.valid, String(widened)).toBe(false);
     }
   });
 });

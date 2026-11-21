@@ -58,6 +58,7 @@ import {
   recomputePaymentCeilingAfterPriceChange,
 } from "../paymentCeiling.js";
 import { usdcToStroops as toStroops } from "../usdcAmount.js";
+import { normalizeMetadataPointer } from "../metadataHash.js";
 /**
  * Decimal USDC as on-chain stroops, throwing on an amount the shared converter
  * will not accept — a price that cannot be expressed exactly must not be
@@ -95,13 +96,16 @@ export async function register(
   return `Registered as publisher.\nProfile: ${activeProfileName}\nID: ${res.data.id}\nAPI key persisted to ${STATE_FILE} (not shown). Run mindvault_reset to revoke.`;
 }
 
-export async function publish(args: {
-  title: string;
-  description?: string;
-  price: string;
-  externalUrl: string;
-  dryRun?: boolean;
-}): Promise<string> {
+export async function publish(
+  args: {
+    title: string;
+    description?: string;
+    price: string;
+    externalUrl: string;
+    dryRun?: boolean;
+  },
+  onProgress?: (progress: number, total?: number, message?: string) => Promise<void>,
+): Promise<string> {
   if (args.dryRun) {
     return JSON.stringify(
       dryRunPublish(args, NETWORK, BASE_URL, !!activeProfile().wallet, !!currentApiKey()),
@@ -113,6 +117,7 @@ export async function publish(args: {
   const snapshot = captureProfileSnapshot();
   const apiKey = snapshot.apiKey ?? requireApiKey();
 
+  await onProgress?.(1, 3, "Creating resource");
   const createRes = await jsonFetch(`${snapshot.baseUrl}/resources`, {
     method: "POST",
     headers: { "x-api-key": apiKey },
@@ -146,6 +151,7 @@ export async function publish(args: {
     }
   }
 
+  await onProgress?.(2, 3, "Verifying content");
   const paidFetch = makePaidFetch(snapshot.wallet, snapshot.network);
 
   const verifyRes = await paidFetch(`${snapshot.baseUrl}/verify-content`, {
@@ -181,6 +187,7 @@ export async function publish(args: {
       .join("\n");
   }
 
+  await onProgress?.(3, 3, "Registering on-chain");
   const registerRes = await jsonFetch(`${BASE_URL}/resources/${resource.id}/register`, {
     method: "POST",
     headers: { "x-api-key": apiKey },
@@ -251,8 +258,28 @@ export async function buy(
   intervalMs?: unknown,
 ): Promise<string> {
   if (dryRun) {
+    const initialDryRun = dryRunBuy(
+      resourceId,
+      NETWORK,
+      BASE_URL,
+      !!activeProfile().wallet,
+      estimatedPrice ?? null,
+    );
+    if (!initialDryRun.validation.resourceId.valid) {
+      return JSON.stringify(initialDryRun, null, 2);
+    }
+
+    const meta = await jsonFetch(`${BASE_URL}/resources/${resourceId}/meta`);
+    if (!meta.ok || meta.data?.price == null) {
+      throw new Error(
+        "Automatic payment blocked because the resource price could not be determined; no x402 payment was submitted.",
+      );
+    }
+    const previewPrice = String(meta.data.price);
+    const approvedPrice = estimatedPrice ?? previewPrice;
+    assertAutoPaymentWithinCeiling({ price: approvedPrice, maxAutoPayUsdc });
     return JSON.stringify(
-      dryRunBuy(resourceId, NETWORK, BASE_URL, !!activeProfile().wallet, estimatedPrice ?? null),
+      dryRunBuy(resourceId, NETWORK, BASE_URL, !!activeProfile().wallet, previewPrice),
       null,
       2,
     );
@@ -611,13 +638,14 @@ async function signAndSendRegistryTx(
 
 export async function updateMetadata(resourceId: string, metadata: string): Promise<string> {
   const wallet = requireWallet();
-  if (_isMock()) return mockUpdateMetadata(resourceId, metadata);
+  const normalizedMetadata = normalizeMetadataPointer(metadata);
+  if (_isMock()) return mockUpdateMetadata(resourceId, normalizedMetadata);
 
   const client = makeClient(wallet.publicKey);
 
   let tx: Awaited<ReturnType<typeof client.update_metadata>>;
   try {
-    tx = await client.update_metadata({ id: resourceId, metadata });
+    tx = await client.update_metadata({ id: resourceId, metadata: normalizedMetadata });
   } catch (err: any) {
     if (isTimeoutError(err)) {
       throw mcpError(
@@ -654,7 +682,7 @@ export async function updateMetadata(resourceId: string, metadata: string): Prom
     {
       status: "success",
       resourceId,
-      metadata,
+      metadata: normalizedMetadata,
       txHash,
     },
     null,
@@ -961,7 +989,7 @@ export async function publishBatch(
     verifiedItems.push({
       id: resource.id,
       price: usdcToStroops(item.price),
-      metadata: resource.accessUrl ?? item.externalUrl,
+      metadata: normalizeMetadataPointer(resource.accessUrl ?? item.externalUrl),
       tags: [],
       content_hash: undefined,
     });

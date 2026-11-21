@@ -13,6 +13,39 @@ export const CATALOG_DEFAULT_LIMIT = 20;
 export const CATALOG_MAX_LIMIT = 100;
 
 const PRICE_RE = /^\d+(\.\d+)?$/;
+const CATALOG_CURRENCY = "USDC";
+
+/**
+ * Exact non-negative decimal string comparison (arbitrary fractional precision).
+ * Returns -1 when a < b, 0 when equal ("0.5" == "0.50" == "0.5000000"), 1 when
+ * a > b, or null when either side is not a valid non-negative decimal string.
+ */
+export function compareDecimalStrings(a: string, b: string): number | null {
+  const left = a.trim();
+  const right = b.trim();
+  if (!PRICE_RE.test(left) || !PRICE_RE.test(right)) return null;
+  const [leftInt, leftFrac = ""] = left.split(".");
+  const [rightInt, rightFrac = ""] = right.split(".");
+  const intA = BigInt(leftInt);
+  const intB = BigInt(rightInt);
+  if (intA !== intB) return intA < intB ? -1 : 1;
+  const maxFrac = Math.max(leftFrac.length, rightFrac.length);
+  const fracA = leftFrac.padEnd(maxFrac, "0");
+  const fracB = rightFrac.padEnd(maxFrac, "0");
+  if (fracA === fracB) return 0;
+  return fracA < fracB ? -1 : 1;
+}
+
+/**
+ * Shared USDC catalog assumption: omitted or blank currency defaults to USDC;
+ * explicit currency values are compared case-insensitively.
+ */
+function isUsdcCurrency(currency: unknown): boolean {
+  if (currency === undefined || currency === null) return true;
+  if (typeof currency !== "string") return false;
+  const normalized = currency.trim().toUpperCase();
+  return normalized === "" || normalized === CATALOG_CURRENCY;
+}
 
 export interface CatalogFilters {
   query?: string;
@@ -108,7 +141,7 @@ export function parseCatalogFilters(
       error: "Invalid maxPrice: must be a non-negative number string (e.g. '5.00').",
     };
   }
-  if (minPrice && maxPrice && parseFloat(minPrice) > parseFloat(maxPrice)) {
+  if (minPrice && maxPrice && (compareDecimalStrings(minPrice, maxPrice) ?? 0) > 0) {
     return { ok: false, error: "Invalid price range: minPrice cannot be greater than maxPrice." };
   }
 
@@ -267,27 +300,65 @@ export function describeCatalogFilters(filters: CatalogFilters): string {
 
 function normalizeTagList(tags: unknown): string[] {
   if (!Array.isArray(tags)) return [];
-  return tags.filter((t): t is string => typeof t === "string").map((t) => t.toLowerCase());
+  return tags
+    .filter((t): t is string => typeof t === "string")
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
 }
 
 /**
- * Client-side filters for fields the public catalog API does not accept
- * (tags, listed, verificationStatus=skipped) plus keyword matching for tests.
+ * Client-side catalog filter matching the server's `applyCatalogFilters`
+ * contract (keyword normalization, exact decimal USDC price bounds,
+ * verificationStatus, resourceType, owner) plus client-only fields
+ * (`tags`, `listed`, `verificationStatus=skipped`) so live, cached, and mock
+ * catalog paths never disagree.
  */
 export function applyClientCatalogFilters<T extends Record<string, unknown>>(
   items: T[],
   filters: CatalogFilters,
 ): T[] {
   const q = filters.query ? normalizeSearchTerm(filters.query) : undefined;
-  const wantedTags = filters.tags?.map((t) => t.toLowerCase()) ?? [];
-  const skippedOnly = filters.verificationStatus === "skipped";
+  const owner = filters.owner ? filters.owner.trim().toLowerCase() : undefined;
+  const minPrice = filters.minPrice !== undefined ? filters.minPrice.trim() : undefined;
+  const maxPrice = filters.maxPrice !== undefined ? filters.maxPrice.trim() : undefined;
+  const wantedTags = filters.tags?.map((t) => t.trim().toLowerCase()).filter(Boolean) ?? [];
 
   return items.filter((r) => {
     if (q) {
-      const hay = normalizeSearchTerm(`${r.title ?? ""} ${r.description ?? ""}`);
-      if (!hay.includes(q)) return false;
+      const title = normalizeSearchTerm(String(r.title ?? ""));
+      const description = normalizeSearchTerm(String(r.description ?? ""));
+      if (!title.includes(q) && !description.includes(q)) return false;
     }
-    if (skippedOnly && r.verificationStatus !== "skipped") return false;
+
+    if (minPrice !== undefined || maxPrice !== undefined) {
+      if (!isUsdcCurrency(r.currency)) return false;
+      const rowPrice =
+        typeof r.price === "string" || typeof r.price === "number" ? String(r.price) : "";
+      if (minPrice !== undefined) {
+        const cmp = compareDecimalStrings(rowPrice, minPrice);
+        if (cmp === null || cmp < 0) return false;
+      }
+      if (maxPrice !== undefined) {
+        const cmp = compareDecimalStrings(rowPrice, maxPrice);
+        if (cmp === null || cmp > 0) return false;
+      }
+    }
+
+    if (filters.verificationStatus && r.verificationStatus !== filters.verificationStatus) {
+      return false;
+    }
+
+    if (filters.resourceType && r.resourceType !== filters.resourceType) {
+      return false;
+    }
+
+    if (owner) {
+      const publisherName =
+        typeof r.publisherName === "string" ? r.publisherName.toLowerCase() : "";
+      const walletAddress =
+        typeof r.walletAddress === "string" ? r.walletAddress.toLowerCase() : "";
+      if (!publisherName.includes(owner) && !walletAddress.includes(owner)) return false;
+    }
 
     // The server's public catalog only returns listed=true resources. When a
     // resource is tombstoned or delisted its `listed` flag is set to false and
@@ -313,10 +384,21 @@ export function applyClientCatalogFilters<T extends Record<string, unknown>>(
   });
 }
 
-/** Numeric price of a catalog row; NaN prices sort last. */
-function priceOf(row: Record<string, unknown>): number {
-  const value = parseFloat(String(row.price ?? ""));
-  return Number.isFinite(value) ? value : Number.POSITIVE_INFINITY;
+/** Exact decimal price comparison for catalog sorting; unparseable prices sort last. */
+function compareRowPrices(
+  a: Record<string, unknown>,
+  b: Record<string, unknown>,
+  direction: "asc" | "desc",
+): number {
+  const aRaw = a.price !== undefined && a.price !== null ? String(a.price).trim() : "";
+  const bRaw = b.price !== undefined && b.price !== null ? String(b.price).trim() : "";
+  const aValid = PRICE_RE.test(aRaw);
+  const bValid = PRICE_RE.test(bRaw);
+  if (!aValid && !bValid) return 0;
+  if (!aValid) return 1;
+  if (!bValid) return -1;
+  const cmp = compareDecimalStrings(aRaw, bRaw) ?? 0;
+  return direction === "asc" ? cmp : -cmp;
 }
 
 /** Creation timestamp as epoch ms; rows without one keep their incoming order. */
@@ -347,10 +429,10 @@ export function applyCatalogSort<T extends Record<string, unknown>>(
   const sorted = [...items];
   switch (sort) {
     case "price_asc":
-      sorted.sort((a, b) => priceOf(a) - priceOf(b));
+      sorted.sort((a, b) => compareRowPrices(a, b, "asc"));
       break;
     case "price_desc":
-      sorted.sort((a, b) => priceOf(b) - priceOf(a));
+      sorted.sort((a, b) => compareRowPrices(a, b, "desc"));
       break;
     case "title":
       sorted.sort((a, b) => String(a.title ?? "").localeCompare(String(b.title ?? "")));

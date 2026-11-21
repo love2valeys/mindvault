@@ -89,6 +89,7 @@ export const FEE_SPENDING_TOOLS = [
   "mindvault_set_price",
   "mindvault_transfer_ownership",
   "mindvault_set_listed",
+  "mindvault_set_tags",
   "mindvault_freeze",
   "mindvault_royalty",
 ] as const;

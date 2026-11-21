@@ -76,6 +76,7 @@ describe("createProgressEmitter", () => {
         progress: 2,
         total: 4,
         message: "Processing",
+        _meta: { "mindvault/progressSequence": 1 },
       },
     });
   });
@@ -91,6 +92,7 @@ describe("createProgressEmitter", () => {
       params: {
         progressToken: 42,
         progress: 1,
+        _meta: { "mindvault/progressSequence": 1 },
       },
     });
   });
@@ -108,6 +110,7 @@ describe("createProgressEmitter", () => {
         progress: 3,
         total: 5,
         message: "step",
+        _meta: { "mindvault/progressSequence": 1 },
       },
     });
   });
@@ -125,8 +128,27 @@ describe("createProgressEmitter", () => {
         progress: 1,
         total: 2,
         message: "init",
+        _meta: { "mindvault/progressSequence": 1 },
       },
     });
+  });
+
+  it("returns a no-op when send is absent", async () => {
+    const emit = createProgressEmitter({ token: "tok-no-send" });
+    await expect(emit(1, 2, "step")).resolves.toBeUndefined();
+  });
+
+  it("suppresses notifications once the request signal is aborted", async () => {
+    const send = vi.fn().mockResolvedValue(undefined);
+    const controller = new AbortController();
+    const emit = createProgressEmitter({ token: "tok-abort", send, signal: controller.signal });
+
+    await emit(1, 2, "before abort");
+    controller.abort();
+    await emit(2, 2, "after abort");
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0]).toMatchObject({ params: { message: "before abort" } });
   });
 
   it("calls send for every invocation", async () => {
@@ -139,6 +161,12 @@ describe("createProgressEmitter", () => {
     await emit(4, 4, "d");
 
     expect(send).toHaveBeenCalledTimes(4);
+    expect(send.mock.calls.map(([notification]) => notification.params._meta)).toEqual([
+      { "mindvault/progressSequence": 1 },
+      { "mindvault/progressSequence": 2 },
+      { "mindvault/progressSequence": 3 },
+      { "mindvault/progressSequence": 4 },
+    ]);
   });
 });
 
@@ -216,5 +244,36 @@ describe("scopeProgressToRequest", () => {
     void progress.emit(1, 1, "x");
 
     await expect(progress.settle()).resolves.toBeUndefined();
+  });
+
+  it("reports settled state before and after settle", async () => {
+    const { send, pending } = deferredSend();
+    const progress = scopeProgressToRequest(send);
+
+    expect(progress.settled).toBe(false);
+    void progress.emit(1, 1, "in-flight");
+
+    const settling = progress.settle();
+    // Scope is marked settled immediately so no new notifications can start while draining.
+    expect(progress.settled).toBe(true);
+    await progress.emit(2, 2, "dropped-while-draining");
+    expect(send).toHaveBeenCalledTimes(1);
+
+    pending[0].resolve();
+    await settling;
+    expect(progress.settled).toBe(true);
+  });
+
+  it("bounds settle wait when settleTimeoutMs is configured for a stalled transport", async () => {
+    const { send } = deferredSend();
+    const progress = scopeProgressToRequest(send, { settleTimeoutMs: 15 });
+
+    // Never resolves — simulates a closed or stalled transport stream.
+    void progress.emit(1, 1, "stalled");
+
+    const start = Date.now();
+    await expect(progress.settle()).resolves.toBeUndefined();
+    expect(Date.now() - start).toBeLessThan(250);
+    expect(progress.settled).toBe(true);
   });
 });

@@ -19,6 +19,27 @@ Transitions: `None -> Pending -> Failed`, `None/Pending -> Failed` (settler-repo
 failure), and `None/Pending/Failed -> Confirmed` (retry succeeds). `Confirmed` is
 terminal; anchors are immutable and writing one clears the failure and attempt
 records. The `anchor` event is emitted exactly when a pair becomes `Confirmed`,
-and `anchrfail` accompanies every failure record, so reads and events agree.
+and `anchrfail` accompanies every failed anchor attempt or failure record, so
+reads and events agree.
 
-TypeScript bindings must be regenerated (`pnpm contract:bindings`).
+## Anchor failure event (`anchrfail`)
+
+Every non-reverting anchor failure path (`attempt_anchor_purchase_receipt`,
+`record_anchor_failure`, and `retry_anchor_purchase_receipt`) publishes the
+same structured Soroban event:
+
+- **Topics**: `(symbol_short!("anchrfail"), resource_id)`
+- **Payload**: `AnchorFailure { resource_id, buyer, receipt_hash, reason, ledger }`
+
+| `AnchorFailureReason` | Emitted by | Resulting `AnchorStatus` |
+| --- | --- | --- |
+| `ResourceNotFound` | `attempt_anchor_purchase_receipt` | `Pending` (or `Failed` at attempt cap) |
+| `InvalidReceiptHash` | `attempt_anchor_purchase_receipt`, `retry_anchor_purchase_receipt` | `Pending` / `Failed` |
+| `DuplicateReceipt` | `attempt_anchor_purchase_receipt`, `retry_anchor_purchase_receipt` | `Confirmed` (existing anchor preserved) |
+| `RetryTooSoon` | `attempt_anchor_purchase_receipt` | `Pending` |
+| `AttemptsExhausted` | `attempt_anchor_purchase_receipt` | `Failed` |
+| `VerifierUnavailable` | `record_anchor_failure` | `Failed` |
+| `NoPaymentRecorded` | `retry_anchor_purchase_receipt` | `Failed` |
+| `ReceiptHashMismatch` | `retry_anchor_purchase_receipt` | `Failed` |
+
+TypeScript bindings must be regenerated (`pnpm contract:bindings`) if exported signatures change.

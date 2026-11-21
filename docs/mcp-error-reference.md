@@ -251,6 +251,19 @@ mindvault_setup_wallet to create a new wallet.
 
 `mindvault_wallet_info`'s structured output carries the same fact as
 `ownsAddress`, so an agent can branch on it without parsing prose.
+`mindvault_wallet_balances` runs the same keystore ownership check across every
+configured profile: any unowned address is flagged in its row `note` and
+excluded from spendable totals and `spendSummary.currentBalanceUsdc`.
+
+For direct diagnostics checks (such as inspecting a funded address surfaced by a
+timed-out creation), `diagnoseSponsoredWallet` and
+`formatSponsoredWalletDiagnostic` in
+[`mcp/src/sponsoredDiagnostics.ts`](../mcp/src/sponsoredDiagnostics.ts) compare
+the reported or stored address against the local keystore and mark unowned
+addresses `status: "stale_unowned"` (`owned: false`, `stale: true`). If a 5xx or
+timeout error body from the sponsored-account service includes a funded address
+field (`publicKey`, `address`, or `account`), `mapSponsoredHttpFailure` appends
+guidance warning that the address was not persisted and is not owned locally.
 
 Finally, a failed state-file write no longer reports success: when the wallet is
 created but `~/.mindvault/state.json` cannot be written, the reply says the

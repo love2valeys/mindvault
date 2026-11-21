@@ -54,11 +54,7 @@ export interface ParsedMetadataHash {
 
 /** Why a value was rejected. Stable identifiers, safe to branch on. */
 export type MetadataHashErrorCode =
-  | "not_a_string"
-  | "empty"
-  | "unknown_algorithm"
-  | "invalid_characters"
-  | "invalid_length";
+  "not_a_string" | "empty" | "unknown_algorithm" | "invalid_characters" | "invalid_length";
 
 export class MetadataHashError extends Error {
   readonly code: MetadataHashErrorCode;
@@ -257,5 +253,44 @@ export function describeMetadataPointerHash(pointer: unknown): MetadataHashRepor
       algorithm: null,
       reason: err instanceof MetadataHashError ? err.message : "contentHash is not a valid digest.",
     };
+  }
+}
+
+/**
+ * Normalize a metadata pointer string before writing or updating it in the
+ * vault registry.
+ *
+ * HTTP(S) URL pointers are normalized identically to how `hashLinkResource` on
+ * the server normalizes external URLs at publish time (see
+ * `server/src/utils/crypto.ts`):
+ *
+ *   - Trim surrounding whitespace
+ *   - Lowercase scheme + host
+ *   - Strip trailing slashes from pathname (unless the pathname is exactly "/")
+ *   - Sort query parameters alphabetically
+ *
+ * Applying this on both publish and update paths ensures a pointer like
+ * `https://example.com/metadata.json/` matches `https://example.com/metadata.json`
+ * so resources hashed at publish can always be updated with an equivalent pointer.
+ *
+ * Non-HTTP(S) schemes (`ipfs://`, `ar://`, `sha256:`, `0x…`) and malformed URLs
+ * are passed through trimmed without mutation.
+ */
+export function normalizeMetadataPointer(pointer: string): string {
+  const trimmed = pointer.trim();
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+  try {
+    const u = new URL(trimmed);
+    u.hostname = u.hostname.toLowerCase();
+    u.pathname = u.pathname.replace(/\/+$/, "") || "/";
+    const sorted = Array.from(u.searchParams.entries()).sort(([a], [b]) => a.localeCompare(b));
+    u.search = "";
+    sorted.forEach(([k, v]) => u.searchParams.append(k, v));
+    return u.toString();
+  } catch {
+    // Malformed URL — return as-is and let contract validation reject it.
+    return trimmed;
   }
 }

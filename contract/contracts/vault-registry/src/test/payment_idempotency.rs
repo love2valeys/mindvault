@@ -339,3 +339,197 @@ fn record_payment_idempotent_is_blocked_while_paused() {
         Err(Ok(Error::ContractPaused))
     );
 }
+
+#[test]
+fn retry_after_resource_delisted_or_tombstoned_returns_stored_receipt() {
+    let (env, creator, admin, settler, client) = setup_with_settler();
+    let id = register_default(&env, &creator, &client, "idemstate");
+    let payer = Address::generate(&env);
+    let receipt_id = idem_str(&env, "idem-state");
+    let tx_hash = idem_str(&env, "0xidemstate");
+
+    let first = client.record_payment_idempotent(
+        &settler,
+        &receipt_id,
+        &id,
+        &payer,
+        &IDEMPOTENT_PRICE,
+        &tx_hash,
+    );
+
+    // Delisting or tombstoning after the payment was recorded must not turn a
+    // retry into `ResourceNotMutable`, while a new receipt id is still blocked.
+    client.delist(&id);
+    let retried_delisted = client.record_payment_idempotent(
+        &settler,
+        &receipt_id,
+        &id,
+        &payer,
+        &IDEMPOTENT_PRICE,
+        &tx_hash,
+    );
+    assert_eq!(retried_delisted, first);
+    assert_eq!(
+        last_call_topics(&env),
+        std::vec::Vec::<std::string::String>::new()
+    );
+    assert_eq!(
+        client.try_record_payment_idempotent(
+            &settler,
+            &idem_str(&env, "idem-state-new"),
+            &id,
+            &payer,
+            &IDEMPOTENT_PRICE,
+            &idem_str(&env, "0xidemstatenew"),
+        ),
+        Err(Ok(Error::ResourceNotMutable))
+    );
+
+    client.tombstone_resource(&id, &admin);
+    let retried_tombstoned = client.record_payment_idempotent(
+        &settler,
+        &receipt_id,
+        &id,
+        &payer,
+        &IDEMPOTENT_PRICE,
+        &tx_hash,
+    );
+    assert_eq!(retried_tombstoned, first);
+    assert_eq!(
+        last_call_topics(&env),
+        std::vec::Vec::<std::string::String>::new()
+    );
+}
+
+#[test]
+fn retry_by_second_authorized_settler_returns_stored_receipt() {
+    let (env, creator, _admin, settler_a, client) = setup_with_settler();
+    let settler_b = Address::generate(&env);
+    client.add_settler(&settler_b);
+    let id = register_default(&env, &creator, &client, "idembackup");
+    let payer = Address::generate(&env);
+    let receipt_id = idem_str(&env, "idem-backup");
+    let tx_hash = idem_str(&env, "0xidembackup");
+
+    let first = client.record_payment_idempotent(
+        &settler_a,
+        &receipt_id,
+        &id,
+        &payer,
+        &IDEMPOTENT_PRICE,
+        &tx_hash,
+    );
+
+    // Failover facilitator retrying with identical arguments receives the same
+    // receipt without duplicating storage or events.
+    let retried = client.record_payment_idempotent(
+        &settler_b,
+        &receipt_id,
+        &id,
+        &payer,
+        &IDEMPOTENT_PRICE,
+        &tx_hash,
+    );
+    assert_eq!(retried, first);
+    assert_eq!(
+        last_call_topics(&env),
+        std::vec::Vec::<std::string::String>::new()
+    );
+
+    // Conflicting arguments from another authorized settler are still rejected.
+    assert_eq!(
+        client.try_record_payment_idempotent(
+            &settler_b,
+            &receipt_id,
+            &id,
+            &payer,
+            &IDEMPOTENT_PRICE,
+            &idem_str(&env, "0xidembackup-conflict"),
+        ),
+        Err(Ok(Error::ReceiptAlreadyExists))
+    );
+}
+
+#[test]
+fn retry_after_partial_refund_preserves_refund_state() {
+    let (env, creator, _admin, settler, client) = setup_with_settler();
+    let id = register_default(&env, &creator, &client, "idemrefund");
+    let payer = Address::generate(&env);
+    let receipt_id = idem_str(&env, "idem-refund");
+    let tx_hash = idem_str(&env, "0xidemrefund");
+
+    client.record_payment_idempotent(
+        &settler,
+        &receipt_id,
+        &id,
+        &payer,
+        &IDEMPOTENT_PRICE,
+        &tx_hash,
+    );
+    client.settle_payment(&settler, &receipt_id);
+    client.record_creator_refund(
+        &creator,
+        &idem_str(&env, "idem-ref-1"),
+        &receipt_id,
+        &payer,
+        &40i128,
+        &idem_str(&env, "0xidemreftx1"),
+    );
+
+    let retried = client.record_payment_idempotent(
+        &settler,
+        &receipt_id,
+        &id,
+        &payer,
+        &IDEMPOTENT_PRICE,
+        &tx_hash,
+    );
+    assert_eq!(retried.state, PaymentState::Settled);
+    assert_eq!(
+        last_call_topics(&env),
+        std::vec::Vec::<std::string::String>::new()
+    );
+    assert_eq!(client.get_refunded_amount(&receipt_id), 40i128);
+}
+
+#[test]
+fn record_payment_idempotent_is_blocked_while_payments_paused() {
+    let (env, creator, admin, settler, client) = setup_with_settler();
+    let id = register_default(&env, &creator, &client, "idempaypause");
+    let payer = Address::generate(&env);
+    let receipt_id = idem_str(&env, "idem-paypause");
+    let tx_hash = idem_str(&env, "0xidempaypause");
+
+    client.record_payment_idempotent(
+        &settler,
+        &receipt_id,
+        &id,
+        &payer,
+        &IDEMPOTENT_PRICE,
+        &tx_hash,
+    );
+    client.set_payments_paused(&admin, &true);
+
+    assert_eq!(
+        client.try_record_payment_idempotent(
+            &settler,
+            &receipt_id,
+            &id,
+            &payer,
+            &IDEMPOTENT_PRICE,
+            &tx_hash,
+        ),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(
+        client.try_record_payment_idempotent(
+            &settler,
+            &idem_str(&env, "idem-paypause-2"),
+            &id,
+            &payer,
+            &IDEMPOTENT_PRICE,
+            &idem_str(&env, "0xidempaypause2"),
+        ),
+        Err(Ok(Error::ContractPaused))
+    );
+}

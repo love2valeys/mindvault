@@ -40,6 +40,13 @@ Budgets differ by service because the work differs: a catalog read should be
 quick, while an x402 payment includes on-chain settlement and is legitimately
 slow.
 
+`mindvault_tx_status` can also watch a submitted hash with `wait: true`. It
+polls at a bounded interval and deadline, emits monotonic progress notifications,
+and can be canceled without losing the hash needed for a later lookup. After a
+buy has submitted payment, an RPC lookup failure returns the submitted hash and
+a retryable status instead of implying the payment failed; retry with
+`mindvault_tx_status`.
+
 | Service   | Env var                        | Default | Covers                                                   |
 | --------- | ------------------------------ | ------- | -------------------------------------------------------- |
 | `http`    | `MINDVAULT_HTTP_TIMEOUT_MS`    | 15000   | MindVault API and the sponsored-account service          |

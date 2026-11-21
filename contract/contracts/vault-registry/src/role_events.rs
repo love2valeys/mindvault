@@ -4,6 +4,10 @@
 //! account (or, for `recover`, an untyped `(old, new)` tuple), so an indexer
 //! could not tell who authorized a change or which account it replaced. Every
 //! admin-role mutation now publishes a [`RoleRotation`].
+//!
+//! Verifier recovery rotations (`rotate_verifier` / `reset_verifier`) emit
+//! `rmverif`, `addverif` (`RoleChange`), and `verrot` (`VerifierRotation`) in
+//! `lib.rs` so indexers can audit compromised verifier key replacements.
 
 use soroban_sdk::{contracttype, Address, Env, Symbol};
 

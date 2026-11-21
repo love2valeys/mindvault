@@ -227,3 +227,141 @@ fn creator_listed_count_never_exceeds_creator_resource_count() {
     assert_eq!(listed, 2);
     assert_counts(&client, &creator, 2);
 }
+
+#[test]
+fn creator_listed_count_increments_on_register_with_hash_and_memo() {
+    let (env, creator, client) = setup();
+    let meta = String::from_str(&env, "ipfs://clchashmemo");
+    let hash_id = String::from_str(&env, "clchash1");
+    let memo_id = String::from_str(&env, "clcmemo1");
+    let memo = BytesN::from_array(&env, &[0xAB; 32]);
+
+    client.register_with_hash(
+        &creator,
+        &hash_id,
+        &100i128,
+        &meta,
+        &empty_tags(&env),
+        &Some(String::from_str(&env, "sha256:deadbeef")),
+    );
+    assert_counts(&client, &creator, 1);
+
+    client.register_with_memo(
+        &creator,
+        &memo_id,
+        &200i128,
+        &meta,
+        &empty_tags(&env),
+        &None,
+        &Some(memo),
+    );
+    assert_counts(&client, &creator, 2);
+    assert_eq!(client.listed_count(), 2);
+}
+
+#[test]
+fn creator_listed_count_moves_with_transfer_ownership_with_terms() {
+    let (env, creator, client) = setup();
+    let new_owner = Address::generate(&env);
+    let listed_id = register_default(&env, &creator, &client, "clctwt1");
+    let delisted_id = register_default(&env, &creator, &client, "clctwt2");
+    client.delist(&delisted_id);
+    assert_counts(&client, &creator, 1);
+
+    client.transfer_ownership_with_terms(
+        &listed_id,
+        &new_owner,
+        &Some(String::from_str(&env, "terms-hash-v1")),
+        &false,
+    );
+    assert_counts(&client, &creator, 0);
+    assert_counts(&client, &new_owner, 1);
+    assert_eq!(client.listed_count(), 1);
+
+    client.transfer_ownership_with_terms(&delisted_id, &new_owner, &None, &false);
+    assert_counts(&client, &creator, 0);
+    assert_counts(&client, &new_owner, 1);
+    assert_eq!(client.creator_resource_count(&creator), 0);
+    assert_eq!(client.creator_resource_count(&new_owner), 2);
+}
+
+#[test]
+fn creator_listed_count_reconciles_across_tombstone_from_frozen_and_disputed() {
+    let (env, creator, admin, client) = setup_with_admin();
+    let frozen_id = register_default(&env, &creator, &client, "clctfrz");
+    let disputed_id = register_default(&env, &creator, &client, "clctdsp");
+    let survivor = register_default(&env, &creator, &client, "clctkeep");
+
+    client.freeze_resource(&frozen_id);
+    client.open_dispute(&disputed_id, &admin);
+    assert_counts(&client, &creator, 1);
+
+    // Tombstoning already-inactive states must not double-decrement.
+    client.tombstone_resource(&frozen_id, &admin);
+    assert_counts(&client, &creator, 1);
+    assert_eq!(client.listed_count(), 1);
+
+    client.tombstone_resource(&disputed_id, &admin);
+    assert_counts(&client, &creator, 1);
+    assert_eq!(client.listed_count(), 1);
+    assert_eq!(client.creator_resource_count(&creator), 1);
+
+    // Tombstoning the surviving listed resource drops both counters to zero.
+    client.tombstone_resource(&survivor, &admin);
+    assert_counts(&client, &creator, 0);
+    assert_eq!(client.listed_count(), 0);
+    assert_eq!(client.creator_resource_count(&creator), 0);
+}
+
+#[test]
+fn creator_listed_count_matches_list_by_creator_page_across_mixed_states() {
+    let (env, creator, admin, client) = setup_with_admin();
+    let other = Address::generate(&env);
+    for i in 0..6u32 {
+        register_default(&env, &creator, &client, &format!("clcpag{i}"));
+    }
+    register_default(&env, &other, &client, "clcother");
+
+    client.delist(&String::from_str(&env, "clcpag1"));
+    client.freeze_resource(&String::from_str(&env, "clcpag2"));
+    client.open_dispute(&String::from_str(&env, "clcpag3"), &admin);
+    client.tombstone_resource(&String::from_str(&env, "clcpag4"), &admin);
+
+    // Walk every creator page with small page size and count Listed entries.
+    let mut cursor = IdCursor::Start;
+    let mut scanned_listed = 0u32;
+    while cursor != IdCursor::End {
+        let page = client.list_by_creator_page(&creator, &cursor, &2u32);
+        for r in page.items.iter() {
+            if r.state == ResourceState::Listed {
+                scanned_listed += 1;
+            }
+        }
+        cursor = page.next_cursor;
+    }
+
+    assert_eq!(scanned_listed, 2);
+    assert_eq!(client.creator_listed_count(&creator), scanned_listed);
+    assert_eq!(client.creator_listed_count(&other), 1);
+    assert_eq!(client.listed_count(), 3);
+}
+
+#[test]
+fn creator_listed_count_overflow_surfaces_count_overflow() {
+    let (env, creator, client) = setup();
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::CreatorListedCount(creator.clone()), &u32::MAX);
+    });
+
+    let res = client.try_register(
+        &creator,
+        &String::from_str(&env, "clcovf1"),
+        &100i128,
+        &String::from_str(&env, "ipfs://ovf"),
+        &empty_tags(&env),
+    );
+    assert_eq!(res, Err(Ok(Error::CountOverflow)));
+    assert_eq!(client.count(), 0);
+}

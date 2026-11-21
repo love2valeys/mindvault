@@ -13,9 +13,11 @@
 extern crate alloc;
 
 mod anchor_status;
+mod attestation_hash;
 mod capability_version;
 mod role_events;
 pub use anchor_status::AnchorStatus;
+pub use attestation_hash::TaggedAttestationHash;
 pub use capability_version::ROLE_CAPABILITY_VERSION;
 pub use role_events::RoleRotation;
 
@@ -77,6 +79,8 @@ pub const FIELD_MASK_LIFECYCLE: u32 = 1 << 9;
 /// `set_flag_reason_hash`. Same bound as `MAX_TERMS_HASH_LEN` — both store a
 /// fixed-size digest of arbitrary off-chain content.
 pub const MAX_FLAG_REASON_HASH_LEN: u32 = 64;
+/// Maximum length of an optional dispute reason hash attached to refunds (MAX_REFUND_REASON_HASH_LEN).
+pub const MAX_REFUND_REASON_HASH_LEN: u32 = 64;
 const MAX_TAGS: u32 = 8;
 /// Decimal places in Stellar USDC, so 1 USDC is `10^7` base units. A USDC base
 /// unit is *not* a "stroop" (a stroop is `10^-5` XLM — a 100x difference).
@@ -97,13 +101,21 @@ pub const MAX_RESOURCE_ID_LEN: u32 = 24;
 /// easy to find, document, and change in a single place instead of
 /// scattered `limit.min(20)` literals.
 pub const LIST_PAGE_CAP: u32 = 20;
+/// Maximum catalog entries scanned by one holder lease listing request.
+pub const LEASE_PAGE_CAP: u32 = 20;
 pub const TOP_TAGS_CAP: u32 = 20;
 /// Maximum number of resources that can be registered in a single batch
 /// via `register_batch`. Keeps execution bounded and prevents transaction
 /// timeouts.
 pub const MAX_BATCH_REGISTER: u32 = 10;
+/// Maximum number of IDs accepted by a single batch read (`get_many`,
+/// `get_many_ordered`, `get_owner_many`). Matches `MAX_STATE_BATCH`.
+pub const MAX_BATCH_READ: u32 = 20;
 /// Maximum number of prices that can be updated in one `set_price_many` call.
 pub const MAX_BATCH_PRICE_UPDATES: u32 = 10;
+/// Maximum number of ids accepted by a single `repair_index_chunk` call, so
+/// each chunked index-repair transaction stays bounded on large registries.
+pub const REPAIR_INDEX_CHUNK_CAP: u32 = 50;
 
 // ── Fee / royalty configuration ──────────────────────────────────────────────
 /// Fee basis-point ceiling: 50 % (5 000 bp). Neither platform_fee_bps nor
@@ -172,6 +184,12 @@ pub const METHOD_SCHEMA: &[(&str, &str)] = &[
     ("get_metadata_pointers", "—"),
     ("set_tags", "creator"),
     ("set_royalty_recipient", "creator"),
+    ("set_royalties_disabled", "creator"),
+    ("royalties_disabled", "—"),
+    ("set_resale_royalty", "original creator"),
+    ("get_resale_royalty", "—"),
+    ("preview_resale_royalty", "—"),
+    ("get_resale_royalty_summary", "—"),
     ("set_listed", "creator"),
     ("delist", "creator"),
     ("freeze_resource", "creator"),
@@ -189,6 +207,7 @@ pub const METHOD_SCHEMA: &[(&str, &str)] = &[
     ("get", "—"),
     ("get_resource_state", "—"),
     ("get_many", "—"),
+    ("get_many_ordered", "—"),
     ("get_resource_states", "—"),
     ("exists", "—"),
     ("exists_many", "—"),
@@ -215,12 +234,14 @@ pub const METHOD_SCHEMA: &[(&str, &str)] = &[
     ("add_verifier", "admin"),
     ("remove_verifier", "admin"),
     ("rotate_verifier", "admin"),
+    ("reset_verifier", "admin"),
     ("is_verifier", "—"),
     ("list_role_members", "—"),
     ("set_verification_status", "verifier"),
     ("revoke_attestation", "verifier"),
     ("get_attestation_reason_hash", "—"),
     ("get_attestation_hash", "—"),
+    ("get_tagged_attestation_hash", "—"),
     ("compute_attestation_hash", "—"),
     ("verify_attestation_hash", "—"),
     ("get_memo_hash", "—"),
@@ -281,8 +302,11 @@ pub const METHOD_SCHEMA: &[(&str, &str)] = &[
     ("set_fee_recipient", "admin"),
     ("set_fee_destination", "admin"),
     ("get_fee_destination", "—"),
+    ("preview_fee_split", "—"),
+    ("preview_fee_split_for_resource", "—"),
     // ── Index repair ──────────────────────────────────────────────────────
     ("repair_index", "admin"),
+    ("repair_index_chunk", "admin"),
     ("repair_tag_index", "admin"),
     // ── Payment receipts ──────────────────────────────────────────────────
     ("record_payment", "settler + payer"),
@@ -299,12 +323,16 @@ pub const METHOD_SCHEMA: &[(&str, &str)] = &[
     ("get_refund", "—"),
     ("get_refunded_amount", "—"),
     ("get_refund_deadline", "—"),
+    ("get_remaining_refundable", "—"),
     ("anchor_purchase_receipt", "verifier"),
     ("attempt_anchor_purchase_receipt", "verifier"),
     ("override_purchase_receipt_anchor", "admin"),
     ("get_purchase_receipt", "—"),
     ("get_anchor_attempts", "—"),
     ("get_anchor_status", "—"),
+    ("record_anchor_failure", "settler"),
+    ("get_anchor_failure", "—"),
+    ("retry_anchor_purchase_receipt", "settler"),
     // ── Access leases ─────────────────────────────────────────────────────
     ("buy_lease", "holder"),
     ("renew_lease", "holder"),
@@ -314,6 +342,7 @@ pub const METHOD_SCHEMA: &[(&str, &str)] = &[
     ("get_lease", "—"),
     ("lease_is_active", "—"),
     ("lease_price", "—"),
+    ("list_holder_leases_page", "—"),
     // ── TTL ───────────────────────────────────────────────────────────────
     ("extend_resource_ttl", "creator"),
     // ── Creator earnings estimator (#804) ─────────────────────────────────
@@ -351,12 +380,12 @@ pub const ERROR_SCHEMA: &[(u32, &str, &str)] = &[
     (15, "NoPendingTransfer", "No pending transfer exists for this resource."),
     (16, "ReservedId", "Resource id collides with a reserved word (e.g. `admin`, `registry`)."),
     (17, "PriceExceedsMax", "Price exceeds `MAX_PRICE`."),
-    (18, "AdminNotSet", "`add_verifier`, `remove_verifier`, `rotate_verifier`, or `repair_index` was called before any admin was bootstrapped."),
+    (18, "AdminNotSet", "`add_verifier`, `remove_verifier`, `rotate_verifier`, `reset_verifier`, or `repair_index` was called before any admin was bootstrapped."),
     (19, "NotVerifier", "`set_verification_status` was called by an address that does not hold the verifier role."),
     (20, "InvalidVerificationTransition", "The requested `VerificationStatus` transition is not allowed (e.g. same-status no-op, or reverting to `Pending`)."),
     (21, "AlreadyFrozen", "`freeze_metadata` was called on a resource whose metadata is already frozen."),
     (22, "MetadataFrozen", "`update_metadata` was called on a resource whose metadata has been frozen."),
-    (23, "DuplicateInRepair", "`repair_index` received a list with duplicate resource ids."),
+    (23, "DuplicateInRepair", "`repair_index` or `repair_index_chunk` received a list with duplicate resource ids."),
     (24, "InvalidTxHash", "A payment or refund `tx_hash` is empty or exceeds `MAX_TX_HASH_LEN` (128 bytes)."),
     (25, "InvalidPaymentAmount", "A payment or refund `amount` is `<= 0`, or a refund window is outside its allowed bounds."),
     (26, "NotModerator", "Caller does not hold the moderator role."),
@@ -370,7 +399,7 @@ pub const ERROR_SCHEMA: &[(u32, &str, &str)] = &[
     (34, "FeeBpsTooHigh", "A fee or fee-destination basis-point value exceeds its configured ceiling."),
     (35, "TotalFeeTooHigh", "The combined fee policy or fee-destination split is invalid."),
     (36, "CountOverflow", "The global resource count would overflow `u32`."),
-    (37, "BatchTooLarge", "`get_many` or `get_owner_many` was called with more than 20 ids."),
+    (37, "BatchTooLarge", "`get_many`, `get_many_ordered`, or `get_owner_many` received more than 20 ids, or `repair_index_chunk` received more than `REPAIR_INDEX_CHUNK_CAP` (50) ids."),
     (38, "DuplicateReceipt", "A purchase receipt is already anchored for `(resource_id, buyer)`."),
     (39, "FlagReasonHashTooLong", "`reason_hash` in `set_flag_reason_hash` exceeds `MAX_FLAG_REASON_HASH_LEN` (64 bytes)."),
     (40, "ContractPaused", "A state-changing method was called while the registry is paused."),
@@ -387,6 +416,7 @@ pub const ERROR_SCHEMA: &[(u32, &str, &str)] = &[
     (51, "InvalidMetadataPointers", "`set_metadata_pointers` received an empty, oversized (> `MAX_METADATA_POINTERS`), or duplicate pointer list, or an out-of-range `primary` index."),
     (52, "AdminAlreadySet", "`bootstrap_dual_admin` was called after an admin was already set."),
     (53, "RecoveryAdminNotSet", "`recover_admin` was called but no recovery admin is configured."),
+    (54, "InvalidRepairCursor", "`repair_index_chunk` received a cursor past the current `Count`, which would claim index slots the repair never wrote."),
 ];
 
 /// Canonical list of every event topic this contract emits, paired with a
@@ -414,6 +444,14 @@ pub const EVENT_SCHEMA: &[(&str, &str)] = &[
         "(prev_tags: Vec<String>, next_tags: Vec<String>)",
     ),
     ("setroyal", "(old_recipient: Option<Address>, new_recipient: Option<Address>)"),
+    (
+        "setresroy",
+        "ResaleRoyaltyUpdated { id, original_creator, old_bps, new_bps, recipient }",
+    ),
+    (
+        "resaleroy",
+        "ResaleRoyaltyCaptured { id, from, to, recipient, basis_amount, royalty_bps, royalty_amount, ledger }",
+    ),
     ("transfer", "(previous_owner: Address, new_owner: Address)"),
     ("propose", "(owner: Address, proposed: Address)"),
     ("cancel", "owner: Address"),
@@ -430,8 +468,6 @@ pub const EVENT_SCHEMA: &[(&str, &str)] = &[
     ("setptrs", "MetadataPointers { pointers, primary }"),
     ("nomadmin", "RoleRotation { actor, previous, replacement }"),
     ("accadmin", "RoleRotation { actor, previous, replacement }"),
-    ("nomadmin", "new_admin: Address"),
-    ("accadmin", "new_admin: Address"),
     ("nomcancel", "cancelled_nominee: Address"),
     ("netinit", "network_id: BytesN<32>"),
     ("freeze", "()"),
@@ -488,7 +524,7 @@ pub const EVENT_SCHEMA: &[(&str, &str)] = &[
     ("refwin", "(old_window_ledgers: u32, new_window_ledgers: u32)"),
     (
         "refund",
-        "RefundReceipt { refund_id, payment_receipt_id, resource_id, recipient, amount, tx_hash, initiated_by, recorded_at, admin_override }",
+        "RefundReceipt { refund_id, payment_receipt_id, resource_id, recipient, amount, tx_hash, initiated_by, recorded_at, admin_override, remaining_balance, reason_hash }",
     ),
     ("addmod", "RoleChange { admin, target, granted: true }"),
     ("rmmod", "RoleChange { admin, target, granted: false }"),
@@ -649,6 +685,9 @@ pub struct FlagDetails {
     pub last_moderator: Option<Address>,
 }
 
+/// Audit payload published under topic `verrot` when an admin atomically
+/// replaces a compromised or retiring verifier key via `rotate_verifier` or
+/// `reset_verifier`.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct VerifierRotation {
@@ -725,6 +764,21 @@ pub struct BatchRegisterItem {
 pub struct BatchPriceUpdate {
     pub id: String,
     pub new_price: i128,
+}
+
+/// One typed positional entry returned by [`VaultRegistry::get_many_ordered`].
+///
+/// Pairs each requested `id` with `Some(Resource)` when registered or `None`
+/// when absent, preserving exact input ID ordering (including duplicates) so
+/// callers can consume results without re-ordering a map or zipping parallel
+/// vectors.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResourceBatchItem {
+    /// Requested resource ID (echoed in input order).
+    pub id: String,
+    /// Stored resource record when present, or `None` when absent.
+    pub resource: Option<Resource>,
 }
 
 /// Result of a batch registration attempt. Contains successfully registered
@@ -991,6 +1045,17 @@ pub enum AuxKey {
     /// `true`, every payment, refund, anchor, and lease-write method returns
     /// `ContractPaused`, while catalog management stays available.
     PaymentsPaused,
+    /// Per-resource creator opt-out from future royalty routing. Value type: `bool`.
+    RoyaltiesDisabled(String),
+    /// Original creator locked on first resale-royalty opt-in or first
+    /// ownership transfer. Value type: `Address`.
+    OriginalCreator(String),
+    /// Creator opt-in resale royalty configuration for a resource. Value type:
+    /// `ResaleRoyaltyConfig`.
+    ResaleRoyalty(String),
+    /// Cumulative resale royalty capture audit summary for a resource. Value
+    /// type: `ResaleRoyaltySummary`.
+    ResaleRoyaltySummary(String),
 }
 
 /// Payload of every role grant/revoke event (`addverif`/`rmverif`,
@@ -1162,6 +1227,8 @@ pub struct RefundReceipt {
     pub initiated_by: Address,
     pub recorded_at: u32,
     pub admin_override: bool,
+    pub remaining_balance: i128,
+    pub reason_hash: Option<String>,
 }
 
 /// Immutable on-chain anchor for a purchase receipt hash.
@@ -1301,6 +1368,15 @@ pub struct Lease {
     pub recorded_at: u32,
 }
 
+/// One bounded page of a holder's currently active, unexpired leases.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LeasePage {
+    pub leases: Vec<Lease>,
+    /// Global catalog cursor for the next page, or `None` when the scan is complete.
+    pub next_cursor: Option<u32>,
+}
+
 #[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -1388,12 +1464,22 @@ pub enum Error {
     AdminAlreadySet = 52,
     /// `recover_admin` was called but no recovery admin is configured.
     RecoveryAdminNotSet = 53,
+    /// A `repair_index_chunk` cursor exceeded the current `Count`, which would
+    /// claim index slots the repair never wrote.
+    InvalidRepairCursor = 54,
 }
 
 mod admin_nomination_cancel;
 mod batch_state_reads;
 pub use batch_state_reads::MAX_STATE_BATCH;
+mod fee_split_preview;
+pub use fee_split_preview::FeeSplitPreview;
 mod recovery_target_check;
+mod resale_royalty;
+pub use resale_royalty::{
+    ResaleRoyaltyCaptured, ResaleRoyaltyConfig, ResaleRoyaltyPreview, ResaleRoyaltySummary,
+    ResaleRoyaltyUpdated, MAX_RESALE_ROYALTY_BPS,
+};
 mod role_inventory;
 pub use role_inventory::{RoleKind, RolePage, MAX_ROLE_MEMBERS, ROLE_PAGE_CAP};
 
@@ -1713,13 +1799,19 @@ impl VaultRegistry {
     }
 
     /// Set up to `MAX_METADATA_POINTERS` redundant metadata pointers (e.g.
-    /// IPFS + Arweave + hosted) with `pointers[primary]` as the preferred one,
-    /// so the resource survives a single storage outage. Only the creator may
-    /// call this. Every pointer is validated like `update_metadata`, and
-    /// `Resource.metadata` is set to the primary pointer so single-pointer
-    /// readers keep working. Subject to the same freeze / content-hash rules
-    /// as `update_metadata`: a frozen resource may only re-publish mirrors
-    /// whose primary equals its current pointer. Emits `setptrs`.
+    /// IPFS + Arweave + hosted HTTPS + content hash) with `pointers[primary]`
+    /// as the preferred primary, so the resource survives a single storage
+    /// outage. Only the creator may call this.
+    ///
+    /// Every pointer is validated with `validate_metadata_pointer` (same rules
+    /// as `update_metadata`), duplicates are rejected with
+    /// `InvalidMetadataPointers`, and `Resource.metadata` is updated to the
+    /// primary pointer so single-pointer readers keep working transparently.
+    /// Subject to the same freeze / content-hash rules as `update_metadata`: a
+    /// frozen or content-hashed resource may still add or refresh mirrors as
+    /// long as `pointers[primary]` equals its current `Resource.metadata`, but
+    /// changing the primary returns `MetadataFrozen`. Emits `setptrs` (and
+    /// `updmeta` when the primary pointer changes).
     pub fn set_metadata_pointers(
         env: Env,
         id: String,
@@ -1764,6 +1856,8 @@ impl VaultRegistry {
                     new_metadata: primary_pointer,
                 },
             );
+        } else {
+            Self::bump_persistent(&env, &DataKey::Resource(id.clone()));
         }
 
         let record = MetadataPointers { pointers, primary };
@@ -1774,8 +1868,13 @@ impl VaultRegistry {
         Ok(())
     }
 
-    /// All metadata pointers for a resource. Falls back to a single-entry list
-    /// holding `Resource.metadata` (primary `0`) when no mirrors were set.
+    /// Return all metadata pointers for a resource together with the preferred
+    /// `primary` index. Falls back to a single-entry list holding
+    /// `Resource.metadata` (`primary = 0`) when no mirrors have been set or
+    /// after `update_metadata` invalidated a prior mirror set.
+    ///
+    /// Errors `InvalidResourceId` / `NotFound` like `get`, and remains
+    /// readable while the registry is paused.
     pub fn get_metadata_pointers(env: Env, id: String) -> Result<MetadataPointers, Error> {
         Self::validate_resource_id(&id)?;
         let resource = Self::load(&env, &id)?;
@@ -1830,11 +1929,14 @@ impl VaultRegistry {
 
         let hash_key = DataKey::AttestationHash(id.clone());
         let stored_attestation_hash = match attestation_hash {
-            Some(hash) => Some(Self::normalize_attestation_hash(&env, &hash)?),
+            Some(hash) => Some(attestation_hash::normalize_attestation_hash(&env, &hash)?),
             None => None,
         };
         if let Some(hash) = stored_attestation_hash.clone() {
-            env.storage().persistent().set(&hash_key, &hash);
+            let existing: Option<String> = env.storage().persistent().get(&hash_key);
+            if existing.as_ref() != Some(&hash) {
+                env.storage().persistent().set(&hash_key, &hash);
+            }
             Self::bump_persistent(&env, &hash_key);
         } else {
             env.storage().persistent().remove(&hash_key);
@@ -1879,6 +1981,17 @@ impl VaultRegistry {
         hash
     }
 
+    /// Read the memoized attestation hash for a resource parsed into its
+    /// versioned algorithm tag and raw digest.
+    ///
+    /// Legacy untagged receipts default to `version = ATTESTATION_ENCODING_VERSION_V1`
+    /// (`1`) and `algorithm = DEFAULT_ATTESTATION_HASH_ALGORITHM` (`"sha256"`),
+    /// so historical attestations remain readable as verifiers evolve.
+    pub fn get_tagged_attestation_hash(env: Env, id: String) -> Option<TaggedAttestationHash> {
+        let raw = Self::get_attestation_hash(env.clone(), id)?;
+        attestation_hash::parse_tagged_attestation_hash(&env, &raw).ok()
+    }
+
     /// Revoke an existing attestation for a resource with an explicit, bounded reason hash.
     /// Only an authorized verifier may call this. Retains the verifier's status history
     /// without erasing prior records. Emits `attrevk`.
@@ -1902,7 +2015,7 @@ impl VaultRegistry {
             return Err(Error::InvalidVerificationTransition);
         }
 
-        let normalized_reason = Self::normalize_attestation_hash(&env, &reason_hash)?;
+        let normalized_reason = attestation_hash::normalize_attestation_hash(&env, &reason_hash)?;
 
         let reason_key = DataKey::AttestationReasonHash(id.clone());
         env.storage()
@@ -1979,8 +2092,14 @@ impl VaultRegistry {
         String::from_bytes(&env, &out)
     }
 
-    /// Whether the resource is currently in `status` and its stored
-    /// attestation hash equals `compute_attestation_hash(id, status, document_hash)`.
+    /// Whether the resource is currently in `status` and its memoized
+    /// attestation hash matches `compute_attestation_hash(id, status, document_hash)`
+    /// under canonical `(version, algorithm, digest)` comparison.
+    ///
+    /// Legacy untagged receipts stored prior to tagging are interpreted as
+    /// `(version = 1, algorithm = "sha256")` so they continue to verify, while
+    /// hashes tagged with a different algorithm (e.g. `poseidon`) or version
+    /// (e.g. `v2:sha256`) do not collide.
     pub fn verify_attestation_hash(
         env: Env,
         id: String,
@@ -1994,11 +2113,13 @@ impl VaultRegistry {
         if resource.verified != status {
             return false;
         }
-        match Self::get_attestation_hash(env.clone(), id.clone()) {
-            Some(stored) => {
-                stored == Self::compute_attestation_hash(env, id, status, document_hash)
-            }
-            None => false,
+        let Some(stored) = Self::get_tagged_attestation_hash(env.clone(), id.clone()) else {
+            return false;
+        };
+        let expected_raw = Self::compute_attestation_hash(env.clone(), id, status, document_hash);
+        match attestation_hash::parse_tagged_attestation_hash(&env, &expected_raw) {
+            Ok(expected) => stored == expected,
+            Err(_) => false,
         }
     }
 
@@ -2081,6 +2202,72 @@ impl VaultRegistry {
         Ok(())
     }
 
+    /// Enable or disable future royalty routing for one resource. Only its
+    /// current creator may change this setting; absent storage defaults to false.
+    /// Emits `setroyoff` with the previous and new values.
+    pub fn set_royalties_disabled(env: Env, id: String, disabled: bool) -> Result<(), Error> {
+        Self::require_not_paused(&env)?;
+        Self::validate_resource_id(&id)?;
+        let resource = Self::load(&env, &id)?;
+        resource.creator.require_auth();
+        Self::ensure_mutable(&resource)?;
+
+        let key = AuxKey::RoyaltiesDisabled(id.clone());
+        let old = env.storage().persistent().get(&key).unwrap_or(false);
+        env.storage().persistent().set(&key, &disabled);
+        Self::bump_persistent(&env, &key);
+        env.events()
+            .publish((symbol_short!("setroyoff"), id), (old, disabled));
+        Ok(())
+    }
+
+    /// Read a resource's royalty opt-out setting. Older resources default to false.
+    pub fn royalties_disabled(env: Env, id: String) -> Result<bool, Error> {
+        Self::validate_resource_id(&id)?;
+        Self::load(&env, &id)?;
+        Ok(Self::royalty_opt_out(&env, &id))
+    }
+
+    /// Opt into, update, or clear (`royalty_bps == 0`) a capped resale royalty
+    /// (transfer fee) payable to the original creator (or `recipient`) on
+    /// secondary ownership transfers.
+    ///
+    /// Bounded by [`MAX_RESALE_ROYALTY_BPS`] (1,000 bp = 10 %); higher values
+    /// fail with [`Error::FeeBpsTooHigh`]. Only the original creator while
+    /// still owning the resource may configure or modify this setting; once
+    /// ownership transfers away, terms are locked (`Error::Unauthorized`).
+    /// Emits `setresroy`.
+    pub fn set_resale_royalty(
+        env: Env,
+        id: String,
+        royalty_bps: u32,
+        recipient: Option<Address>,
+    ) -> Result<(), Error> {
+        resale_royalty::set(&env, id, royalty_bps, recipient)
+    }
+
+    /// Read a resource's opt-in resale royalty configuration, or `None` when
+    /// the original creator has not opted in.
+    pub fn get_resale_royalty(env: Env, id: String) -> Result<Option<ResaleRoyaltyConfig>, Error> {
+        resale_royalty::get(&env, id)
+    }
+
+    /// Preview the exact integer floor resale royalty for `id` against
+    /// `sale_amount` (or `resource.price` when `sale_amount` is `None`).
+    pub fn preview_resale_royalty(
+        env: Env,
+        id: String,
+        sale_amount: Option<i128>,
+    ) -> Result<ResaleRoyaltyPreview, Error> {
+        resale_royalty::preview(&env, id, sale_amount)
+    }
+
+    /// Read the cumulative resale royalty capture summary for `id`. Returns
+    /// zero counters when no royalty-bearing secondary transfer has occurred.
+    pub fn get_resale_royalty_summary(env: Env, id: String) -> Result<ResaleRoyaltySummary, Error> {
+        resale_royalty::summary(&env, id)
+    }
+
     pub fn transfer_ownership(env: Env, id: String, new_creator: Address) -> Result<(), Error> {
         Self::require_not_paused(&env)?;
         Self::validate_resource_id(&id)?;
@@ -2091,6 +2278,7 @@ impl VaultRegistry {
             return Err(Error::AlreadyOwner);
         }
         let previous_owner = resource.creator.clone();
+        let basis_price = resource.price;
         resource.creator = new_creator.clone();
         Self::save(&env, &mut resource);
         Self::move_creator_index(&env, &previous_owner, &new_creator, &id, resource.listed);
@@ -2101,8 +2289,15 @@ impl VaultRegistry {
         }
 
         env.events().publish(
-            (symbol_short!("transfer"), id),
-            (previous_owner, new_creator),
+            (symbol_short!("transfer"), id.clone()),
+            (previous_owner.clone(), new_creator.clone()),
+        );
+        resale_royalty::on_ownership_transfer(
+            &env,
+            &id,
+            &previous_owner,
+            &new_creator,
+            basis_price,
         );
         Ok(())
     }
@@ -2140,6 +2335,7 @@ impl VaultRegistry {
         let mut resource = Self::load(&env, &id)?;
         Self::ensure_mutable(&resource)?;
         let previous_owner = resource.creator.clone();
+        let basis_price = resource.price;
         resource.creator = pending_owner.clone();
 
         // Clear dispute flag on ownership transfer - disputes are tied to the
@@ -2152,8 +2348,15 @@ impl VaultRegistry {
         env.storage().persistent().remove(&key);
 
         env.events().publish(
-            (symbol_short!("transfer"), id),
-            (previous_owner, pending_owner),
+            (symbol_short!("transfer"), id.clone()),
+            (previous_owner.clone(), pending_owner.clone()),
+        );
+        resale_royalty::on_ownership_transfer(
+            &env,
+            &id,
+            &previous_owner,
+            &pending_owner,
+            basis_price,
         );
         Ok(())
     }
@@ -2411,9 +2614,10 @@ impl VaultRegistry {
         let owned = Self::creator_count(&env, &resource.creator);
         Self::set_creator_count(&env, &resource.creator, owned.saturating_sub(1));
 
-        env.storage()
-            .persistent()
-            .remove(&DataKey::PendingTransfer(id.clone()));
+        let pending_transfer_key = DataKey::PendingTransfer(id.clone());
+        if env.storage().persistent().has(&pending_transfer_key) {
+            env.storage().persistent().remove(&pending_transfer_key);
+        }
         Self::transition_state(&env, &mut resource, ResourceState::Tombstoned);
         Ok(())
     }
@@ -2459,36 +2663,14 @@ impl VaultRegistry {
         CatalogPage { items, next_cursor }
     }
 
-    /// Paginated list of resources whose `listed` flag is true, in insertion order.
+    /// Paginated list of resources whose `state` is `ResourceState::Listed`, in insertion order.
     ///
     /// - Resources are ordered by registration sequence.
     /// - `limit` is capped at `20`.
-    /// - Delisted resources are skipped; relisted resources will reappear.
+    /// - Delisted, frozen, disputed, and tombstoned resources are skipped; relisted resources will reappear.
     /// - Returns an empty `Vec` if no listed resources fall in range.
     pub fn list_listed(env: Env, start: u32, limit: u32) -> Vec<Resource> {
-        let total: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
-        let page_size = limit.min(LIST_PAGE_CAP);
-        let mut result: Vec<Resource> = Vec::new(&env);
-        let mut i = start;
-        while i < total && result.len() < page_size {
-            let idx_key = DataKey::Index(i);
-            if let Some(id) = env.storage().persistent().get::<DataKey, String>(&idx_key) {
-                Self::bump_persistent(&env, &idx_key);
-                let res_key = DataKey::Resource(id);
-                if let Some(resource) = env
-                    .storage()
-                    .persistent()
-                    .get::<DataKey, Resource>(&res_key)
-                {
-                    Self::bump_persistent(&env, &res_key);
-                    if resource.state == ResourceState::Listed {
-                        result.push_back(resource);
-                    }
-                }
-            }
-            i += 1;
-        }
-        result
+        Self::list_listed_page(env, start, limit).items
     }
 
     /// Paginated listing of resources owned by `creator` in insertion order.
@@ -2586,17 +2768,23 @@ impl VaultRegistry {
         result
     }
 
+    /// Return up to `limit` (capped at [`TOP_TAGS_CAP`]) tags ordered by
+    /// descending successful-registration count, breaking ties
+    /// lexicographically by normalized tag name.
+    ///
+    /// Counts reflect normalized tags recorded at registration time (across
+    /// `register`, `register_with_hash`, `register_with_memo`, and succeeded
+    /// items in `register_batch`), saturate at `u32::MAX`, and are not altered
+    /// by failed registrations, `set_tags`, or tombstoning. Returns an empty
+    /// vector when `limit == 0` or no tags have been registered. Available
+    /// while paused.
     pub fn top_tags(env: Env, limit: u32) -> Vec<TagPopularity> {
         let page_size = limit.min(TOP_TAGS_CAP);
         if page_size == 0 {
             return Vec::new(&env);
         }
 
-        let stats: Vec<TagPopularity> = env
-            .storage()
-            .instance()
-            .get(&DataKey::TopTags)
-            .unwrap_or_else(|| Vec::new(&env));
+        let stats: Vec<TagPopularity> = Self::load_top_tags(&env);
         let mut result: Vec<TagPopularity> = Vec::new(&env);
         let mut i = 0u32;
         while i < stats.len() && result.len() < page_size {
@@ -2643,43 +2831,22 @@ impl VaultRegistry {
         result
     }
 
-    /// Paginated list of resources filtered by verification status.
+    /// Paginated list of resources filtered by verification status
+    /// (`Pending`, `Verified`, `Rejected`, or `Revoked`).
     ///
-    /// Returns resources whose `verified` field matches `status`.
-    /// `cursor` is a global catalog index (same semantics as `list_page`).
-    /// `limit` is capped at 20.
-    /// Returns a `CatalogPage` with `items` (matching resources) and
-    /// `next_cursor` (next catalog position, or `None` at end-of-list).
+    /// Returns resources whose `verified` field matches `status` in catalog
+    /// registration order. `cursor` is a 0-based global catalog index (same
+    /// domain as `list_page`), `limit` is capped at [`LIST_PAGE_CAP`] (20),
+    /// and `next_cursor` is `Some(next_index)` when unscanned slots remain or
+    /// `None` at end-of-list. See `docs/verifier-status-pagination-design.md`
+    /// and [`Self::get_verifier_status_history`].
     pub fn list_by_verification_status(
         env: Env,
         status: VerificationStatus,
         cursor: u32,
         limit: u32,
     ) -> CatalogPage {
-        let total: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
-        let page_size = limit.min(LIST_PAGE_CAP);
-        let mut items: Vec<Resource> = Vec::new(&env);
-        let mut i = cursor;
-        while i < total && items.len() < page_size {
-            let idx_key = DataKey::Index(i);
-            if let Some(id) = env.storage().persistent().get::<DataKey, String>(&idx_key) {
-                Self::bump_persistent(&env, &idx_key);
-                let res_key = DataKey::Resource(id);
-                if let Some(resource) = env
-                    .storage()
-                    .persistent()
-                    .get::<DataKey, Resource>(&res_key)
-                {
-                    Self::bump_persistent(&env, &res_key);
-                    if resource.verified == status {
-                        items.push_back(resource);
-                    }
-                }
-            }
-            i += 1;
-        }
-        let next_cursor = if i < total { Some(i) } else { None };
-        CatalogPage { items, next_cursor }
+        Self::scan_catalog(&env, cursor, limit, |resource| resource.verified == status)
     }
 
     /// `list_listed` with next-cursor metadata: `cursor` and `next_cursor`
@@ -2801,6 +2968,11 @@ impl VaultRegistry {
                 .persistent()
                 .get(&DataKey::Resource(id.clone()))
                 .unwrap(); // already validated above
+                           // Tombstoned resources are permanently purged from derived listing
+                           // indexes and must never be re-added by a tag index repair.
+            if resource.state == ResourceState::Tombstoned {
+                continue;
+            }
             for j in 0..resource.tags.len() {
                 let raw_tag = resource.tags.get(j).unwrap();
                 let tag = Self::normalize_tag(&env, &raw_tag);
@@ -2867,23 +3039,57 @@ impl VaultRegistry {
 
     /// Read several resources in one invocation, preserving input order.
     /// Missing resources are represented by `None`; valid resources are
-    /// returned as `Some(Resource)`. The batch is capped to bound execution
-    /// and response size.
+    /// returned as `Some(Resource)`. The batch is capped at [`MAX_BATCH_READ`]
+    /// (20) IDs to bound execution and response size.
     pub fn get_many(env: Env, ids: Vec<String>) -> Result<Vec<Option<Resource>>, Error> {
-        const MAX_BATCH_SIZE: u32 = 20;
-        if ids.len() > MAX_BATCH_SIZE {
+        if ids.len() > MAX_BATCH_READ {
             return Err(Error::BatchTooLarge);
+        }
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            Self::validate_resource_id(&id)?;
         }
         let mut result: Vec<Option<Resource>> = Vec::new(&env);
         for i in 0..ids.len() {
             let id = ids.get(i).unwrap();
-            Self::validate_resource_id(&id)?;
             let key = DataKey::Resource(id);
             let resource = env.storage().persistent().get(&key);
             if resource.is_some() {
                 Self::bump_persistent(&env, &key);
             }
             result.push_back(resource);
+        }
+        Ok(result)
+    }
+
+    /// Read several resources in one invocation, returning typed
+    /// [`ResourceBatchItem`] entries in exact input ID order.
+    ///
+    /// Unlike `get_many` (which returns positional `Option<Resource>` slots),
+    /// each element pairs the requested `id` with its looked-up `resource`
+    /// (`Some(Resource)` or `None`), preserving duplicates and ordering so
+    /// clients do not need to re-order a map or zip parallel vectors.
+    ///
+    /// Capped at [`MAX_BATCH_READ`] (20) IDs (`Error::BatchTooLarge`). Any
+    /// invalid ID fails the whole call with `Error::InvalidResourceId` before
+    /// reading storage. Bumps persistent TTL for each found resource.
+    pub fn get_many_ordered(env: Env, ids: Vec<String>) -> Result<Vec<ResourceBatchItem>, Error> {
+        if ids.len() > MAX_BATCH_READ {
+            return Err(Error::BatchTooLarge);
+        }
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            Self::validate_resource_id(&id)?;
+        }
+        let mut result: Vec<ResourceBatchItem> = Vec::new(&env);
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            let key = DataKey::Resource(id.clone());
+            let resource: Option<Resource> = env.storage().persistent().get(&key);
+            if resource.is_some() {
+                Self::bump_persistent(&env, &key);
+            }
+            result.push_back(ResourceBatchItem { id, resource });
         }
         Ok(result)
     }
@@ -2934,17 +3140,20 @@ impl VaultRegistry {
     }
 
     /// Batch owner lookup. Returns a `Vec<Option<Address>>` parallel to `ids`.
-    /// Missing resources are `None`; invalid resource ids fail the whole call,
-    /// matching `get_many` and keeping malformed multi-select requests visible.
+    /// Missing resources are `None`; invalid resource ids fail the whole call
+    /// before reading storage, matching `get_many` and keeping malformed
+    /// multi-select requests visible. Capped at [`MAX_BATCH_READ`] (20) IDs.
     pub fn get_owner_many(env: Env, ids: Vec<String>) -> Result<Vec<Option<Address>>, Error> {
-        const MAX_BATCH_SIZE: u32 = 20;
-        if ids.len() > MAX_BATCH_SIZE {
+        if ids.len() > MAX_BATCH_READ {
             return Err(Error::BatchTooLarge);
+        }
+        for i in 0..ids.len() {
+            let id = ids.get(i).unwrap();
+            Self::validate_resource_id(&id)?;
         }
         let mut result: Vec<Option<Address>> = Vec::new(&env);
         for i in 0..ids.len() {
             let id = ids.get(i).unwrap();
-            Self::validate_resource_id(&id)?;
             let key = DataKey::Resource(id);
             let resource: Option<Resource> = env.storage().persistent().get(&key);
             if resource.is_some() {
@@ -3049,10 +3258,8 @@ impl VaultRegistry {
     /// Return the ledger sequence at which the pending admin nomination expires.
     /// Bumps the instance storage TTL to keep the entry alive for active monitors.
     pub fn pending_admin_expiry(env: Env) -> Option<u32> {
-        let expiry = env.storage().instance().get(&DataKey::PendingAdminExpiry);
-        if expiry.is_some() {
-            Self::bump_instance(&env);
-        }
+        let expiry: Option<u32> = env.storage().instance().get(&DataKey::PendingAdminExpiry);
+        Self::bump_instance(&env);
         expiry
     }
 
@@ -3078,6 +3285,14 @@ impl VaultRegistry {
         stored_admin.require_auth();
 
         if new_admin == stored_admin {
+            return Err(Error::SameAdmin);
+        }
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RecoveryAdmin)
+            == Some(new_admin.clone())
+        {
             return Err(Error::SameAdmin);
         }
         if let Some(expiry) = env
@@ -3251,11 +3466,28 @@ impl VaultRegistry {
         let previous_recovery: Option<Address> =
             env.storage().instance().get(&DataKey::RecoveryAdmin);
         match &recovery_admin {
-            Some(recovery) if *recovery == admin => return Err(Error::SameAdmin),
-            Some(recovery) => env
-                .storage()
-                .instance()
-                .set(&DataKey::RecoveryAdmin, recovery),
+            Some(recovery) => {
+                if *recovery == admin {
+                    return Err(Error::SameAdmin);
+                }
+                if let Some(pending) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, Address>(&DataKey::PendingAdmin)
+                {
+                    let expiry: u32 = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, u32>(&DataKey::PendingAdminExpiry)
+                        .unwrap_or(0);
+                    if pending == *recovery && env.ledger().sequence() < expiry {
+                        return Err(Error::SameAdmin);
+                    }
+                }
+                env.storage()
+                    .instance()
+                    .set(&DataKey::RecoveryAdmin, recovery);
+            }
             None => env.storage().instance().remove(&DataKey::RecoveryAdmin),
         }
         Self::bump_instance(&env);
@@ -3282,14 +3514,16 @@ impl VaultRegistry {
             .ok_or(Error::RecoveryAdminNotSet)?;
         recovery.require_auth();
         let old_admin = Self::require_admin(&env)?;
-        if new_admin == old_admin || new_admin == recovery {
-            return Err(Error::SameAdmin);
-        }
-        recovery_target_check::ensure_valid_recovery_target(&env, &new_admin, &old_admin, &recovery)?;
+        recovery_target_check::ensure_valid_recovery_target(
+            &env, &new_admin, &old_admin, &recovery,
+        )?;
         env.storage().instance().remove(&DataKey::PendingAdmin);
         env.storage()
             .instance()
             .remove(&DataKey::PendingAdminExpiry);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminNominatedAt);
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         Self::bump_instance(&env);
         role_events::publish_rotation(
@@ -3361,8 +3595,20 @@ impl VaultRegistry {
     }
 
     /// The active scheduled pause deadline, if one exists.
-    /// Bumps the instance storage TTL to keep the entry alive for active monitors.
+    ///
+    /// Returns `None` when the contract is not paused, when an indefinite
+    /// pause (`set_paused(admin, true)`) is active without a deadline, or once
+    /// the ledger timestamp reaches or passes the deadline. Bumps the instance
+    /// storage TTL when an active deadline is returned.
     pub fn pause_until(env: Env) -> Option<u64> {
+        let paused = env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false);
+        if !paused {
+            return None;
+        }
         let pause_until = env
             .storage()
             .instance()
@@ -3417,6 +3663,16 @@ impl VaultRegistry {
         Ok(())
     }
 
+    /// Atomically replace a compromised or retiring verifier key with a fresh
+    /// replacement key in one audited transaction (#228).
+    ///
+    /// Unlike calling `remove_verifier` followed by `add_verifier`, this flow
+    /// validates both keys upfront (`old_verifier` must be registered,
+    /// `new_verifier` must differ and not already be registered), updates the
+    /// role inventory, and emits `rmverif`, `addverif`, and the `verrot`
+    /// (`VerifierRotation { old_verifier, new_verifier, ledger }`) audit event
+    /// atomically. Allowed while the registry is paused so operators can
+    /// recover from a compromised verifier key during an incident.
     pub fn rotate_verifier(
         env: Env,
         old_verifier: Address,
@@ -3450,6 +3706,20 @@ impl VaultRegistry {
         Ok(())
     }
 
+    /// Admin recovery entrypoint to reset a compromised verifier key to a
+    /// replacement key atomically (#228).
+    ///
+    /// Delegates to [`Self::rotate_verifier`] so both entrypoints share
+    /// identical validation, role-inventory updates, and `rmverif`/`addverif`/
+    /// `verrot` audit events.
+    pub fn reset_verifier(
+        env: Env,
+        old_verifier: Address,
+        new_verifier: Address,
+    ) -> Result<(), Error> {
+        Self::rotate_verifier(env, old_verifier, new_verifier)
+    }
+
     /// Page through the addresses holding `role` (admin, verifier, moderator
     /// or settler), in grant order. Read-only. `limit` is capped at
     /// `ROLE_PAGE_CAP` (20) and each non-admin role tracks at most
@@ -3481,8 +3751,10 @@ impl VaultRegistry {
         Self::require_not_paused(&env)?;
 
         let len = ids.len();
+        // Issue #116: Validate the entire bounded input before writing any index state
         for i in 0..len {
             let id = ids.get(i).unwrap();
+            Self::validate_resource_id(&id)?;
             if !env
                 .storage()
                 .persistent()
@@ -3511,6 +3783,89 @@ impl VaultRegistry {
         env.events()
             .publish((symbol_short!("reindex"), old_count), len);
         Ok(())
+    }
+
+    /// Bounded, resumable variant of [`Self::repair_index`] for registries
+    /// too large to rebuild in a single transaction. Writes the next chunk of
+    /// an authoritative ordered id list into the pagination index and returns
+    /// the cursor to pass to the following call, so an interrupted repair
+    /// resumes safely from the last completed cursor.
+    ///
+    /// `ids` carries the next slice of the operator's authoritative list —
+    /// at most [`REPAIR_INDEX_CHUNK_CAP`] ids (else `BatchTooLarge`) — that
+    /// belongs at catalog positions `cursor..cursor + ids.len()`. Every id
+    /// must already exist as a registered `Resource` (else `NotFound`) and
+    /// the chunk must not contain duplicates (else `DuplicateInRepair`);
+    /// validation covers the whole chunk before any write, so a bad chunk
+    /// fails atomically exactly like `repair_index`. Duplicates spanning two
+    /// different chunks cannot be detected on-chain — the caller must
+    /// de-duplicate the authoritative list off-chain before chunking it.
+    ///
+    /// The chunk is written to `Index(cursor..cursor + ids.len())` and
+    /// `Count` is then set to `cursor + ids.len()` (checked add, else
+    /// `CountOverflow`), so `list`/`list_page`/`count` always expose a
+    /// fully validated prefix even mid-repair. `cursor` must not exceed the
+    /// current `Count` (else `InvalidRepairCursor`): that invariant is what
+    /// guarantees a chunk never claims an index slot the repair did not
+    /// write. An empty chunk is a silent no-op that returns `cursor`
+    /// unchanged and emits no event.
+    ///
+    /// Emits one `reindex` event per non-empty chunk, carrying the count
+    /// before the chunk and the count after it (the returned cursor), so
+    /// audit tooling sees incremental progress with the same topic the
+    /// atomic `repair_index` uses. Same derived-only boundary as
+    /// `repair_index`: `Resource` storage is never read for content,
+    /// written, or deleted. See `docs/index-repair.md` for the full
+    /// strategy.
+    pub fn repair_index_chunk(env: Env, ids: Vec<String>, cursor: u32) -> Result<u32, Error> {
+        let admin = Self::require_admin(&env)?;
+        admin.require_auth();
+        Self::require_not_paused(&env)?;
+
+        if ids.len() > REPAIR_INDEX_CHUNK_CAP {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let old_count: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
+        if cursor > old_count {
+            return Err(Error::InvalidRepairCursor);
+        }
+
+        let len = ids.len();
+        if len == 0 {
+            return Ok(cursor);
+        }
+
+        for i in 0..len {
+            let id = ids.get(i).unwrap();
+            if !env
+                .storage()
+                .persistent()
+                .has(&DataKey::Resource(id.clone()))
+            {
+                return Err(Error::NotFound);
+            }
+            for j in (i + 1)..len {
+                if id == ids.get(j).unwrap() {
+                    return Err(Error::DuplicateInRepair);
+                }
+            }
+        }
+
+        let end = cursor.checked_add(len).ok_or(Error::CountOverflow)?;
+
+        for i in 0..len {
+            let id = ids.get(i).unwrap();
+            let idx_key = DataKey::Index(cursor + i);
+            env.storage().persistent().set(&idx_key, &id);
+            Self::bump_persistent(&env, &idx_key);
+        }
+        env.storage().instance().set(&DataKey::Count, &end);
+        Self::bump_instance(&env);
+
+        env.events()
+            .publish((symbol_short!("reindex"), old_count), end);
+        Ok(end)
     }
 
     /// Set the registry-level fee / royalty configuration. Only the admin may
@@ -3542,8 +3897,14 @@ impl VaultRegistry {
         if config.royalty_bps > MAX_FEE_BPS {
             return Err(Error::FeeBpsTooHigh);
         }
-        // Then validate the combined ceiling
-        if config.platform_fee_bps + config.royalty_bps > MAX_FEE_BPS {
+        // Then validate the combined ceiling and creator minimum share floor
+        let total_fee_bps = config
+            .platform_fee_bps
+            .checked_add(config.royalty_bps)
+            .ok_or(Error::TotalFeeTooHigh)?;
+        if total_fee_bps > MAX_FEE_BPS
+            || FEE_BPS_DENOM.saturating_sub(total_fee_bps) < MIN_CREATOR_SHARE_BPS
+        {
             return Err(Error::TotalFeeTooHigh);
         }
         let destination = Self::load_fee_destination(&env);
@@ -3640,6 +4001,33 @@ impl VaultRegistry {
 
     pub fn get_fee_destination(env: Env) -> FeeDestinationConfig {
         Self::load_fee_destination(&env)
+    }
+
+    /// Calculate the exact integer fee split for a proposed sale amount according
+    /// to the registry's active FeeConfig and FeeDestination.
+    pub fn preview_fee_split(env: Env, amount: i128) -> Result<FeeSplitPreview, Error> {
+        fee_split_preview::compute(&env, amount)
+    }
+
+    /// Calculate a fee split using the resource's royalty opt-out setting.
+    pub fn preview_fee_split_for_resource(
+        env: Env,
+        resource_id: String,
+        amount: i128,
+    ) -> Result<FeeSplitPreview, Error> {
+        Self::validate_resource_id(&resource_id)?;
+        Self::load(&env, &resource_id)?;
+        let disabled = Self::royalty_opt_out(&env, &resource_id);
+        fee_split_preview::compute_with_royalty(&env, amount, !disabled)
+    }
+
+    fn royalty_opt_out(env: &Env, resource_id: &String) -> bool {
+        let key = AuxKey::RoyaltiesDisabled(resource_id.clone());
+        let disabled: Option<bool> = env.storage().persistent().get(&key);
+        if disabled.is_some() {
+            Self::bump_persistent(env, &key);
+        }
+        disabled.unwrap_or(false)
     }
 
     fn default_fee_destination() -> FeeDestinationConfig {
@@ -3855,12 +4243,22 @@ impl VaultRegistry {
         Ok(())
     }
 
-    /// Retry-safe `record_payment`: same auth, validation, and pause rules,
-    /// but returns the stored receipt. If `receipt_id` is already recorded
-    /// with the same `resource_id`, `payer`, `amount`, and `tx_hash`, that
-    /// receipt is returned unchanged, whatever its state, with no write and
-    /// no event. The same id with different arguments still errors
-    /// `ReceiptAlreadyExists`.
+    /// Retry-safe `record_payment`: enforces the same auth, settler role,
+    /// pause (both global and payment-scope), and argument checks, then
+    /// resolves `receipt_id` idempotently:
+    ///
+    /// - If `receipt_id` is absent, writes the receipt and secondary indexes
+    ///   exactly like `record_payment`, emits `payment`, and returns the new
+    ///   [`PaymentReceipt`].
+    /// - If `receipt_id` already exists with identical `resource_id`, `payer`,
+    ///   `amount`, and `tx_hash`, returns the stored [`PaymentReceipt`] as-is
+    ///   with no storage write and no event — even if the receipt has since
+    ///   settled, been partially refunded, had its resource repriced, delisted,
+    ///   or tombstoned, or is retried by a different authorized settler.
+    /// - If `receipt_id` already exists with any differing payload field,
+    ///   rejects the call with `Error::ReceiptAlreadyExists`.
+    /// - If a new `receipt_id` reuses a `tx_hash` already backing another
+    ///   receipt, rejects the call with `Error::DuplicateTxHash`.
     pub fn record_payment_idempotent(
         env: Env,
         settler: Address,
@@ -3879,10 +4277,8 @@ impl VaultRegistry {
             amount,
             &tx_hash,
         )?;
-        let stored: Option<PaymentReceipt> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PaymentReceipt(receipt_id.clone()));
+        let receipt_key = DataKey::PaymentReceipt(receipt_id.clone());
+        let stored: Option<PaymentReceipt> = env.storage().persistent().get(&receipt_key);
         match stored {
             Some(receipt)
                 if receipt.resource_id == resource_id
@@ -4122,6 +4518,17 @@ impl VaultRegistry {
         Ok(refunded)
     }
 
+    /// Remaining balance that can still be refunded for a settled payment receipt.
+    pub fn get_remaining_refundable(env: Env, payment_receipt_id: String) -> Result<i128, Error> {
+        let payment = Self::get_payment(env.clone(), payment_receipt_id.clone())?;
+        let key = DataKey::RefundedAmount(payment_receipt_id);
+        let refunded: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if env.storage().persistent().has(&key) {
+            Self::bump_persistent(&env, &key);
+        }
+        Ok(payment.amount.saturating_sub(refunded))
+    }
+
     /// Exclusive ledger deadline for creator refunds of a settled payment.
     pub fn get_refund_deadline(env: Env, payment_receipt_id: String) -> Result<u32, Error> {
         let payment = Self::get_payment(env.clone(), payment_receipt_id.clone())?;
@@ -4217,14 +4624,13 @@ impl VaultRegistry {
         };
         if let Some(reason) = throttled {
             let failure = AnchorFailure {
-                resource_id: resource_id.clone(),
+                resource_id,
                 buyer,
                 receipt_hash,
                 reason,
                 ledger: now,
             };
-            env.events()
-                .publish((symbol_short!("anchrfail"), resource_id), failure);
+            Self::emit_anchor_failure(&env, failure);
             return Ok(false);
         }
 
@@ -4241,8 +4647,7 @@ impl VaultRegistry {
                 reason,
                 ledger: now,
             };
-            env.events()
-                .publish((symbol_short!("anchrfail"), resource_id.clone()), failure);
+            Self::emit_anchor_failure(&env, failure);
             if attempts.attempts >= MAX_ANCHOR_ATTEMPTS {
                 // Emitted once per pair, on the attempt that reaches the cap.
                 env.events()
@@ -4279,10 +4684,10 @@ impl VaultRegistry {
         buyer: Address,
     ) -> Result<Option<AnchorStatus>, Error> {
         Self::validate_resource_id(&resource_id)?;
-        let has_anchor = env
-            .storage()
-            .persistent()
-            .has(&DataKey::PurchaseReceipt(resource_id.clone(), buyer.clone()));
+        let has_anchor = env.storage().persistent().has(&DataKey::PurchaseReceipt(
+            resource_id.clone(),
+            buyer.clone(),
+        ));
         let has_failure = env
             .storage()
             .persistent()
@@ -4395,7 +4800,7 @@ impl VaultRegistry {
         }
 
         let failure = AnchorFailure {
-            resource_id: resource_id.clone(),
+            resource_id,
             buyer,
             receipt_hash,
             reason: AnchorFailureReason::VerifierUnavailable,
@@ -4403,8 +4808,7 @@ impl VaultRegistry {
         };
         env.storage().persistent().set(&failure_key, &failure);
         Self::bump_persistent(&env, &failure_key);
-        env.events()
-            .publish((symbol_short!("anchrfail"), resource_id), failure);
+        Self::emit_anchor_failure(&env, failure);
         Ok(())
     }
 
@@ -4740,16 +5144,23 @@ impl VaultRegistry {
         env.storage().persistent().get(&key).ok_or(Error::NotFound)
     }
 
-    /// Whether a resource currently carries a moderator dispute flag.
-    /// Errors with `NotFound` if the resource does not exist.
+    /// Whether a resource currently carries an active moderator dispute flag.
+    ///
+    /// Errors `InvalidResourceId` or `NotFound` like `get`, and remains
+    /// readable while paused or after a resource is tombstoned.
     pub fn is_flagged(env: Env, id: String) -> Result<bool, Error> {
         Self::validate_resource_id(&id)?;
         Ok(Self::load(&env, &id)?.dispute_flag.is_flagged())
     }
 
-    /// Dispute flag, reason hash, and last acting moderator for a resource in
-    /// one read. Errors with `NotFound` if the resource does not exist; a
-    /// resource no moderator has touched returns `NoFlag` and two `None`s.
+    /// Composite moderation read returning a resource's active `dispute_flag`,
+    /// optional `reason_hash`, and `last_moderator` in one call.
+    ///
+    /// Errors `InvalidResourceId` or `NotFound` like `get`. A resource no
+    /// moderator has acted on returns `DisputeFlag::NoFlag` and two `None`s;
+    /// legacy resources flagged before `DataKey::FlagModerator` existed report
+    /// `last_moderator: None` until the next moderator write. Remains readable
+    /// while paused or after tombstoning.
     pub fn flag_details(env: Env, id: String) -> Result<FlagDetails, Error> {
         Self::validate_resource_id(&id)?;
         let resource = Self::load(&env, &id)?;
@@ -4832,13 +5243,16 @@ impl VaultRegistry {
             return Err(Error::PaymentAmountMismatch);
         }
 
-        let key = DataKey::Lease(resource_id.clone(), holder);
+        let key = DataKey::Lease(resource_id.clone(), holder.clone());
         let mut lease: Lease = env
             .storage()
             .persistent()
             .get(&key)
             .ok_or(Error::NotFound)?;
 
+        if lease.resource_id != resource_id || lease.holder != holder {
+            return Err(Error::NotFound);
+        }
         if lease.state != LeaseState::Active || env.ledger().sequence() >= lease.expiry_ledger {
             return Err(Error::InvalidPaymentTransition);
         }
@@ -4923,10 +5337,11 @@ impl VaultRegistry {
     /// call this. Revocation is immediate and terminal: `lease_is_active`
     /// returns `false` from this ledger on, and the holder may buy a new
     /// lease afterwards. Errors `NotFound` if no lease exists for the pair
-    /// and `InvalidLeaseTransition` if it is already `Revoked`. Emits
-    /// `leaserevk`.
+    /// and `InvalidLeaseTransition` if it is already `Revoked`. Returns
+    /// `ContractPaused` while either pause is active. Emits `leaserevk`.
     pub fn revoke_lease(env: Env, resource_id: String, holder: Address) -> Result<Lease, Error> {
         Self::require_not_paused(&env)?;
+        Self::require_not_payments_paused(&env)?;
         Self::validate_resource_id(&resource_id)?;
         let resource = Self::load(&env, &resource_id)?;
         resource.creator.require_auth();
@@ -4979,6 +5394,48 @@ impl VaultRegistry {
         }
     }
 
+    /// List a holder's active, unexpired leases in resource registration order.
+    /// The global catalog cursor is stable across pages; each call scans at most
+    /// `LEASE_PAGE_CAP` entries (20), even when leases are expired or revoked.
+    pub fn list_holder_leases_page(
+        env: Env,
+        holder: Address,
+        cursor: u32,
+        limit: u32,
+    ) -> LeasePage {
+        let total: u32 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
+        let page_size = limit.min(LEASE_PAGE_CAP);
+        let mut leases = Vec::new(&env);
+        let mut i = cursor;
+        let mut scanned = 0;
+        while i < total && scanned < page_size {
+            let index_key = DataKey::Index(i);
+            if let Some(resource_id) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, String>(&index_key)
+            {
+                Self::bump_persistent(&env, &index_key);
+                let lease_key = DataKey::Lease(resource_id.clone(), holder.clone());
+                if let Some(lease) = env.storage().persistent().get::<DataKey, Lease>(&lease_key) {
+                    if lease.resource_id == resource_id
+                        && lease.holder == holder
+                        && Self::lease_grants_access(&env, &lease)
+                    {
+                        Self::bump_persistent(&env, &lease_key);
+                        leases.push_back(lease);
+                    }
+                }
+            }
+            i += 1;
+            scanned += 1;
+        }
+        LeasePage {
+            leases,
+            next_cursor: if i < total { Some(i) } else { None },
+        }
+    }
+
     /// Extend the TTL of a resource's persistent storage entry.
     ///
     /// Only the resource's current creator (owner) may call this.
@@ -4996,6 +5453,10 @@ impl VaultRegistry {
         }
         let key = DataKey::Resource(resource_id.clone());
         Self::bump_persistent(&env, &key);
+        let pointers_key = DataKey::MetadataPointers(resource_id.clone());
+        if env.storage().persistent().has(&pointers_key) {
+            Self::bump_persistent(&env, &pointers_key);
+        }
         env.events()
             .publish((symbol_short!("ttlext"), resource_id), ());
         Ok(())
@@ -5161,6 +5622,7 @@ impl VaultRegistry {
         }
 
         let previous_owner = resource.creator.clone();
+        let basis_price = resource.price;
         resource.creator = new_creator.clone();
         Self::save(&env, &mut resource);
         Self::move_creator_index(&env, &previous_owner, &new_creator, &id, resource.listed);
@@ -5199,6 +5661,14 @@ impl VaultRegistry {
             (previous_owner.clone(), new_creator.clone()),
         );
 
+        resale_royalty::on_ownership_transfer(
+            &env,
+            &id,
+            &previous_owner,
+            &new_creator,
+            basis_price,
+        );
+
         // Emit the terms-aware event for callers that need the full context.
         env.events().publish(
             (Symbol::new(&env, "txfrterms"), id.clone()),
@@ -5224,6 +5694,7 @@ impl VaultRegistry {
         amount: i128,
         tx_hash: String,
         admin_override: bool,
+        reason_hash: Option<String>,
     ) -> Result<(), Error> {
         Self::require_not_paused(env)?;
         Self::require_not_payments_paused(env)?;
@@ -5232,8 +5703,32 @@ impl VaultRegistry {
         Self::validate_payment_amount(amount)?;
         Self::validate_tx_hash(&tx_hash)?;
 
+        if let Some(ref hash) = reason_hash {
+            Self::validate_bounded_string(
+                hash,
+                1,
+                MAX_REFUND_REASON_HASH_LEN,
+                Error::RefundReasonHashTooLong,
+                Error::RefundReasonHashTooLong,
+            )?;
+        }
+
         let refund_key = DataKey::RefundReceipt(refund_id.clone());
-        if env.storage().persistent().has(&refund_key) {
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, RefundReceipt>(&refund_key)
+        {
+            if existing.payment_receipt_id == payment_receipt_id
+                && existing.recipient == recipient
+                && existing.amount == amount
+                && existing.tx_hash == tx_hash
+                && existing.initiated_by == initiator
+                && existing.admin_override == admin_override
+                && existing.reason_hash == reason_hash
+            {
+                return Ok(());
+            }
             return Err(Error::ReceiptAlreadyExists);
         }
         let refund_tx_key = DataKey::RefundTxHash(tx_hash.clone());
@@ -5292,6 +5787,7 @@ impl VaultRegistry {
         let next_refunded = refunded
             .checked_add(amount)
             .ok_or(Error::PaymentAmountMismatch)?;
+        let remaining_balance = payment.amount.saturating_sub(next_refunded);
 
         let refund = RefundReceipt {
             refund_id: refund_id.clone(),
@@ -5303,6 +5799,8 @@ impl VaultRegistry {
             initiated_by: initiator,
             recorded_at: env.ledger().sequence(),
             admin_override,
+            remaining_balance,
+            reason_hash,
         };
         env.storage().persistent().set(&refund_key, &refund);
         Self::bump_persistent(env, &refund_key);
@@ -5318,6 +5816,31 @@ impl VaultRegistry {
         Ok(())
     }
 
+    /// Compute the minimum allowed resource price in USDC base units for a
+    /// given [`FeeConfig`].
+    ///
+    /// Without an active fee config (or when both rates are zero), the floor
+    /// is `1` base unit. Otherwise the reserve floor is
+    /// `platform_fee_bps + royalty_bps + 1`, ensuring both `royalty_bps < price`
+    /// and `platform_fee_bps + royalty_bps < price` so tiny prices cannot yield
+    /// negative or zero-remainder splits.
+    pub(crate) fn min_price_for_fee_config(config: Option<&FeeConfig>) -> i128 {
+        let combined_fee_bps: i128 = config
+            .map(|c| i128::from(c.platform_fee_bps.saturating_add(c.royalty_bps)))
+            .unwrap_or(0);
+        combined_fee_bps + 1
+    }
+
+    /// Active minimum allowed resource price in USDC base units under the
+    /// currently stored [`DataKey::FeeConfig`].
+    pub(crate) fn minimum_price_floor(env: &Env) -> i128 {
+        let config = env
+            .storage()
+            .instance()
+            .get::<DataKey, FeeConfig>(&DataKey::FeeConfig);
+        Self::min_price_for_fee_config(config.as_ref())
+    }
+
     fn validate_price(env: &Env, price: i128) -> Result<(), Error> {
         if price <= 0 {
             return Err(Error::InvalidPrice);
@@ -5325,22 +5848,12 @@ impl VaultRegistry {
         if price > MAX_PRICE {
             return Err(Error::PriceExceedsMax);
         }
-        // Enforce the minimum creator-share invariant: the price in stroops must
-        // strictly exceed the *combined* fee take (platform_fee_bps +
-        // royalty_bps) so the creator always receives a positive remainder.
-        //
-        // Checking only royalty_bps (the old rule) was insufficient: a
-        // platform_fee_bps > 0 stacked on top of royalty_bps could consume the
-        // entire remaining amount, leaving the creator with zero even when
-        // royalty_bps alone was below the price.  No fee config set means no
-        // fees are owed, so the check is a no-op until one is configured.
-        let combined_fee_bps: i128 = env
-            .storage()
-            .instance()
-            .get::<DataKey, FeeConfig>(&DataKey::FeeConfig)
-            .map(|config| i128::from(config.platform_fee_bps + config.royalty_bps))
-            .unwrap_or(0);
-        if combined_fee_bps >= price {
+        // Enforce the explicit reserve-price / minimum-royalty floor: the price
+        // in USDC base units must strictly exceed the *combined* fee take
+        // (`platform_fee_bps + royalty_bps`, which also enforces
+        // `price > royalty_bps`) so the creator always receives a positive
+        // remainder. No fee config set yields a floor of 1 base unit.
+        if price < Self::minimum_price_floor(env) {
             return Err(Error::InvalidPrice);
         }
         Ok(())
@@ -5410,7 +5923,7 @@ impl VaultRegistry {
         // The referenced resource must exist and be for sale: a delisted,
         // frozen, disputed, or tombstoned resource must not accept payments.
         let resource = Self::load(env, &resource_id)?;
-        if resource.state != ResourceState::Listed {
+        if resource.frozen || resource.state != ResourceState::Listed {
             return Err(Error::ResourceNotMutable);
         }
 
@@ -5572,46 +6085,6 @@ impl VaultRegistry {
         }
     }
 
-    fn normalize_attestation_hash(env: &Env, hash: &String) -> Result<String, Error> {
-        let bytes = Self::string_bytes(hash);
-        let mut separator = None;
-        for (idx, byte) in bytes.iter().enumerate() {
-            if *byte == b':' {
-                separator = Some(idx);
-                break;
-            }
-        }
-
-        if let Some(separator) = separator {
-            let algorithm = &bytes[..separator];
-            let digest = &bytes[separator + 1..];
-            if algorithm.is_empty()
-                || algorithm.len() > MAX_ATTESTATION_HASH_ALGORITHM_LEN as usize
-                || digest.is_empty()
-                || digest.len() > MAX_ATTESTATION_HASH_LEN as usize
-            {
-                return Err(Error::AttestationHashTooLong);
-            }
-            for &byte in algorithm {
-                if !matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_') {
-                    return Err(Error::AttestationHashTooLong);
-                }
-            }
-            return Ok(hash.clone());
-        }
-
-        if bytes.is_empty() || bytes.len() > MAX_ATTESTATION_HASH_LEN as usize {
-            return Err(Error::AttestationHashTooLong);
-        }
-        let mut tagged = alloc::vec::Vec::with_capacity(
-            DEFAULT_ATTESTATION_HASH_ALGORITHM.len() + 1 + bytes.len(),
-        );
-        tagged.extend_from_slice(DEFAULT_ATTESTATION_HASH_ALGORITHM.as_bytes());
-        tagged.push(b':');
-        tagged.extend_from_slice(&bytes);
-        Ok(String::from_bytes(env, &tagged))
-    }
-
     /// Normalize every tag in the input list to lowercase ASCII, validate
     /// count and length limits, enforce uniqueness in normalized form, and
     /// return the normalized `Vec<String>`.
@@ -5753,6 +6226,7 @@ impl VaultRegistry {
                 .expect("listed count underflow")
         };
         env.storage().instance().set(&DataKey::ListedCount, &next);
+        Self::bump_instance(env);
     }
 
     fn require_current_admin(env: &Env, admin: &Address) -> Result<(), Error> {
@@ -5771,11 +6245,16 @@ impl VaultRegistry {
             .ok_or(Error::NotFound)
     }
 
-    /// Remember `moderator` as the last to act on `id`'s moderation state.
+    /// Remember `moderator` as the last to act on `id`'s moderation state and
+    /// keep any attached `FlagReasonHash` entry TTL-synchronized with it.
     fn record_flag_moderator(env: &Env, id: &String, moderator: &Address) {
         let key = DataKey::FlagModerator(id.clone());
         env.storage().persistent().set(&key, moderator);
         Self::bump_persistent(env, &key);
+        let reason_key = DataKey::FlagReasonHash(id.clone());
+        if env.storage().persistent().has(&reason_key) {
+            Self::bump_persistent(env, &reason_key);
+        }
     }
 
     fn save(env: &Env, resource: &mut Resource) {
@@ -5784,6 +6263,14 @@ impl VaultRegistry {
         let key = DataKey::Resource(resource.id.clone());
         env.storage().persistent().set(&key, resource as &Resource);
         Self::bump_persistent(env, &key);
+        let royalty_key = AuxKey::RoyaltiesDisabled(resource.id.clone());
+        if env.storage().persistent().has(&royalty_key) {
+            Self::bump_persistent(env, &royalty_key);
+        }
+        let pointers_key = DataKey::MetadataPointers(resource.id.clone());
+        if env.storage().persistent().has(&pointers_key) {
+            Self::bump_persistent(env, &pointers_key);
+        }
     }
 
     /// Extend persistent entry TTL when below threshold (Soroban archival safety).
@@ -5939,6 +6426,7 @@ impl VaultRegistry {
     }
 
     fn remove_from_creator_index(env: &Env, creator: &Address, id: &String) {
+        let key = Self::creator_key(env, creator);
         let list = Self::creator_list(env, creator);
         let mut out: Vec<String> = Vec::new(env);
         for i in 0..list.len() {
@@ -5947,10 +6435,14 @@ impl VaultRegistry {
                 out.push_back(v);
             }
         }
-        env.storage()
-            .persistent()
-            .set(&Self::creator_key(env, creator), &out);
-        Self::bump_persistent(env, &Self::creator_key(env, creator));
+        if out.is_empty() {
+            if env.storage().persistent().has(&key) {
+                env.storage().persistent().remove(&key);
+            }
+        } else {
+            env.storage().persistent().set(&key, &out);
+            Self::bump_persistent(env, &key);
+        }
     }
 
     /// Move a resource id from `previous_owner`'s index/count to `new_owner`'s,
@@ -6100,6 +6592,15 @@ impl VaultRegistry {
         None
     }
 
+    /// Emit the structured `anchrfail` event scoped to `failure.resource_id`.
+    /// Shared by every non-reverting anchor-failure path so topic shape and
+    /// payload stay identical across verifier and settler entry points.
+    fn emit_anchor_failure(env: &Env, failure: AnchorFailure) {
+        let resource_id = failure.resource_id.clone();
+        env.events()
+            .publish((symbol_short!("anchrfail"), resource_id), failure);
+    }
+
     /// Persist an [`AnchorFailure`] for `(resource_id, buyer)` and emit
     /// `anchrfail`, returning `Ok(false)` so callers can `return` it directly.
     /// Overwrites any earlier record: the newest reason describes the current
@@ -6114,7 +6615,7 @@ impl VaultRegistry {
     ) -> Result<bool, Error> {
         let key = DataKey::AnchorFailure(resource_id.clone(), buyer.clone());
         let failure = AnchorFailure {
-            resource_id: resource_id.clone(),
+            resource_id,
             buyer,
             receipt_hash,
             reason,
@@ -6122,8 +6623,7 @@ impl VaultRegistry {
         };
         env.storage().persistent().set(&key, &failure);
         Self::bump_persistent(env, &key);
-        env.events()
-            .publish((symbol_short!("anchrfail"), resource_id), failure);
+        Self::emit_anchor_failure(env, failure);
         Ok(false)
     }
 
@@ -6237,16 +6737,28 @@ impl VaultRegistry {
             .publish((symbol_short!("anchor"), resource_id), anchor);
     }
 
-    /// Return `ContractPaused` if the emergency pause flag is set.
+    /// Return `ContractPaused` if the emergency pause flag is active.
     ///
     /// Every write method calls this at its entry point. Read-only methods
     /// never call it, so they remain available while the registry is paused.
+    /// When a scheduled maintenance window (`DataKey::PauseUntil`) has already
+    /// expired, this lazily clears the stale `Paused` and `PauseUntil` entries
+    /// before allowing the write to proceed.
     fn require_not_paused(env: &Env) -> Result<(), Error> {
         if Self::pause_is_active(env) {
-            Err(Error::ContractPaused)
-        } else {
-            Ok(())
+            return Err(Error::ContractPaused);
         }
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            env.storage().instance().set(&DataKey::Paused, &false);
+            env.storage().instance().remove(&DataKey::PauseUntil);
+            Self::bump_instance(env);
+        }
+        Ok(())
     }
 
     /// Return whether the registry is paused after applying any scheduled

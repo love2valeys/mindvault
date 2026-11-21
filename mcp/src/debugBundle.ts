@@ -32,7 +32,7 @@
 import { closeSync, existsSync, fstatSync, openSync, readSync } from "node:fs";
 
 import { resolveRotationConfig } from "./auditLogRotation.js";
-import { isAuditLogEnabled } from "./auditLog.js";
+import { getAuditFileWriter, isAuditLogEnabled } from "./auditLog.js";
 import { catalogCacheLabel, getCatalogCacheConfig, getCatalogSnapshot } from "./catalogCache.js";
 import { buildConfig, type McpConfig } from "./config.js";
 import { collectStartupDiagnostics, redactSecrets, type StartupDiagnostic } from "./diagnostics.js";
@@ -264,14 +264,21 @@ function readFileTail(path: string): string {
 export function collectAuditTail(env: NodeJS.ProcessEnv, count: number): AuditLogTail {
   const rotation = resolveRotationConfig(env);
   const filePath = rotation?.path ?? null;
-  const exists = filePath !== null && existsSync(filePath);
-  return {
-    enabled: isAuditLogEnabled(),
-    filePath,
-    exists,
-    requested: count,
-    entries: exists && count > 0 ? parseAuditTail(readFileTail(filePath), count) : [],
+  const readTail = () => {
+    const exists = filePath !== null && existsSync(filePath);
+    return {
+      enabled: isAuditLogEnabled(),
+      filePath,
+      exists,
+      requested: count,
+      entries: exists && count > 0 ? parseAuditTail(readFileTail(filePath), count) : [],
+    };
   };
+  const writer = getAuditFileWriter();
+  if (writer && filePath !== null && writer.config.path === filePath) {
+    return writer.withReadLockSync(readTail);
+  }
+  return readTail();
 }
 
 /** Catalog cache configuration plus what the in-memory snapshot holds. */

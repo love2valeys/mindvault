@@ -28,6 +28,7 @@ import {
   ATTESTATION_VERIFICATION_OUTPUT_SCHEMA,
   BATCH_CATALOG_LOOKUP_OUTPUT_SCHEMA,
   CATALOG_LIST_OUTPUT_SCHEMA,
+  CONTRACT_PREFLIGHT_OUTPUT_SCHEMA,
   CONSISTENCY_OUTPUT_SCHEMA,
   FEE_CONFIG_OUTPUT_SCHEMA,
   LIST_PROFILES_OUTPUT_SCHEMA,
@@ -56,6 +57,7 @@ import {
   USE_PROFILE_OUTPUT_SCHEMA,
   WALLET_BALANCES_OUTPUT_SCHEMA,
   WALLET_INFO_OUTPUT_SCHEMA,
+  WALLET_IMPORT_OUTPUT_SCHEMA,
   WALLET_SETUP_OUTPUT_SCHEMA,
 } from "./outputSchemas.js";
 import { PURCHASE_STATUS_OUTPUT_SCHEMA } from "./purchaseStatusLookup.js";
@@ -96,10 +98,16 @@ export interface ToolAnnotations {
   title: string;
   /** The tool performs no state changes or side effects. */
   readOnlyHint: boolean;
-  /** The tool can irreversibly destroy local state. */
+  /** The tool may perform destructive updates. */
   destructiveHint: boolean;
   /** Repeating the tool with identical arguments is safe and yields the same result. */
   idempotentHint: boolean;
+  /**
+   * The tool interacts with an open world outside the local process (the Stellar
+   * network, x402 payment rails). Declared explicitly on every tool that spends
+   * USDC or network fees so clients can gate it.
+   */
+  openWorldHint?: boolean;
 }
 
 export interface ToolDefinition {
@@ -154,6 +162,19 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     outputSchema: WALLET_INFO_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
     annotations: {
       title: "Wallet Info",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
+  {
+    name: "mindvault_wallet_balances",
+    description:
+      "Operator tool: list XLM and USDC balances for every configured agent wallet (one per profile) plus the platform wallet (PLATFORM_WALLET_ADDRESS), so the two-wallet economy is visible in one call. Includes unique-wallet totals and a read-only spend summary for the active profile. Reads Horizon only; secrets are never returned and a single wallet failing to load does not fail the call.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    outputSchema: WALLET_BALANCES_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+    annotations: {
+      title: "Wallet Balances",
       readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
@@ -256,9 +277,9 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       "List resources in the MindVault catalog with the same optional filters as mindvault_search and GET /resources: keyword, price range, verification status, resource type, owner, sort, pagination, tags, and listed state. Sort accepts newest, price_asc, price_desc, or title; results are ordered client-side too, so the order holds even when the backend ignores the parameter.",
     inputSchema: {
       type: "object",
-      properties: { ...catalogFilterInputProperties, ...bypassCacheInputProperty },
       properties: {
         ...catalogFilterInputProperties,
+        ...bypassCacheInputProperty,
         cursor: CATALOG_CURSOR_INPUT_PROPERTY,
       },
       required: [],
@@ -266,7 +287,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     outputSchema: CATALOG_LIST_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
     annotations: {
       title: "Browse Catalog",
-      readOnlyHint: true,
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
     },
@@ -283,7 +304,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     outputSchema: CATALOG_LIST_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
     annotations: {
       title: "Search Catalog",
-      readOnlyHint: true,
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
     },
@@ -390,9 +411,38 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: "mindvault_subscribe_resource",
+    description:
+      "Subscribe to a resource and monitor for price, verification status, or listing changes. Emits notifications/progress updates when changes occur.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        resourceId: {
+          type: "string",
+          description: "Resource ID to monitor for changes.",
+        },
+        intervalMs: {
+          type: "integer",
+          description: "Polling interval in milliseconds (default: 5,000, min: 1,000).",
+        },
+        timeoutMs: {
+          type: "integer",
+          description: "Maximum monitoring duration in milliseconds (default: 60,000).",
+        },
+      },
+      required: ["resourceId"],
+    },
+    annotations: {
+      title: "Subscribe to Resource Changes",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
+  {
     name: "mindvault_publish",
     description:
-      "Publish a link resource to the MindVault catalog. The resource undergoes AI verification (agent wallet pays ~$0.10 USDC via x402) and is automatically registered on-chain if verified. Returns resource ID, access URL, verification result, and on-chain registration status. Pass dryRun: true to validate inputs without submitting payment.",
+      "Publish a link resource to the MindVault catalog. The resource undergoes AI verification (agent wallet pays ~$0.10 USDC via x402) and is automatically registered on-chain if verified. Returns resource ID, access URL, verification result, and on-chain registration status. Pass dryRun: true to validate inputs without creating a resource, calling /verify-content, or submitting payment; it may make free status and balance reads.",
     inputSchema: {
       type: "object",
       properties: {
@@ -424,7 +474,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         dryRun: {
           type: "boolean",
           description:
-            "Optional dry-run flag. When true, validates inputs and shows intended network, endpoint, and required wallet state without submitting payment or transactions.",
+            "Optional dry-run flag. When true, validates inputs and shows intended network, endpoint, and required wallet state without creating a resource, calling /verify-content, submitting payment, or writing transactions.",
         },
         confirmMainnet: {
           type: "boolean",
@@ -441,75 +491,45 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: false,
+      openWorldHint: true,
     },
   },
   {
     name: "mindvault_buy",
     description:
-      "Pay USDC via x402 and access a resource. Payments above MINDVAULT_MAX_AUTO_PAY_USDC (10 USDC by default) require maxAutoPayUsdc set to at least the resource price. On mainnet, pass confirmMainnet: true (or set MINDVAULT_ALLOW_MAINNET=1). Pass dryRun: true to validate the resource and show intended payment flow without submitting payment. Pass wait: true to poll the payment transaction until it settles on-chain before returning.",
+      "Pay USDC via x402 and access a resource. Payments above MINDVAULT_MAX_AUTO_PAY_USDC (10 USDC by default) require maxAutoPayUsdc set to at least the resource price. On mainnet, pass confirmMainnet: true. Pass confirmPaid: true to confirm paid operations.",
     inputSchema: {
       type: "object",
       properties: {
         resourceId: {
           type: "string",
-          description:
-            "The resource ID to buy, from mindvault_browse or mindvault_search. Letters, digits, dot, dash, or underscore.",
-          examples: ["cm7x8y9z", "swcn98besxpp6t1u8e77fqz3"],
+          description: "The resource ID to buy.",
         },
-        dryRun: {
+        confirmPaid: {
           type: "boolean",
-          description:
-            "Optional dry-run flag. When true, validates the resource ID and shows intended network, endpoint, and required wallet state without submitting payment.",
-        },
-        maxAutoPayUsdc: {
-          type: "string",
-          description:
-            "Explicit per-call maximum automatic payment in USDC. Required when this resource costs more than MINDVAULT_MAX_AUTO_PAY_USDC; must be at least the advertised price.",
-          examples: ["25.00"],
+          description: "Explicitly confirm authorization to execute this paid operation.",
         },
         confirmMainnet: {
           type: "boolean",
-          description:
-            "Required on mainnet (or set MINDVAULT_ALLOW_MAINNET=1). Explicitly confirm this mutation/payment on the public Stellar network.",
+          description: "Required on mainnet to confirm transaction execution.",
         },
-        confirmPaid: { ...CONFIRM_PAID_PROPERTY },
-        wait: {
-          type: "boolean",
-          description:
-            "Optional flag. When true, wait and poll the payment transaction on Soroban until it settles (SUCCESS or FAILED) or the timeout elapses, returning a settlement confirmation block. Off by default, in which case the buy returns as soon as the payment response arrives.",
-        },
-        timeoutMs: {
-          type: "integer",
-          minimum: 0,
-          maximum: 300000,
-          description:
-            "Optional deadline in milliseconds for settlement confirmation when wait is true. Default 60000, inclusive maximum 300000.",
-          default: 60000,
-          examples: [30000, 60000],
-        },
-        intervalMs: {
-          type: "integer",
-          minimum: 200,
-          description:
-            "Optional interval in milliseconds between settlement status polls when wait is true. Default 2000, minimum 200.",
-          default: 2000,
-          examples: [500, 2000],
-        },
-        idempotencyKey: {
+        maxAutoPayUsdc: {
           type: "string",
-          description:
-            "Optional client-chosen key (letters, digits, dot, dash, underscore, colon; max 128). When set, the attempt is recorded so mindvault_purchase_status can resolve it if the response is lost. A key that already settled is not paid again.",
-          examples: ["buy-cm7x8y9z-2026-01-01"],
+          description: "Explicit per-call maximum automatic payment in USDC.",
+        },
+        dryRun: {
+          type: "boolean",
+          description: "Dry-run flag.",
         },
       },
       required: ["resourceId"],
     },
-    outputSchema: BUY_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
     annotations: {
-      title: "Buy Resource",
+      title: "Buy Resource (Paid)",
       readOnlyHint: false,
-      destructiveHint: false,
+      destructiveHint: true,
       idempotentHint: false,
+      openWorldHint: true,
     },
   },
   {
@@ -558,6 +578,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: false,
+      openWorldHint: true,
     },
   },
   {
@@ -676,6 +697,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: false,
+      openWorldHint: true,
     },
   },
   {
@@ -699,6 +721,19 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     outputSchema: REGISTRY_INFO_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
     annotations: {
       title: "Registry Info",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
+  {
+    name: "mindvault_contract_preflight",
+    description:
+      "Read the configured registry's on-chain identity, network ID, and Resource schema version. Reports whether the contract ID, configured Stellar network, and schema are compatible, with specific fixes for mismatches. Run this before publish or on-chain registration; it never writes to the contract.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    outputSchema: CONTRACT_PREFLIGHT_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+    annotations: {
+      title: "Contract Preflight",
       readOnlyHint: true,
       destructiveHint: false,
       idempotentHint: true,
@@ -916,7 +951,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "mindvault_tx_status",
     description:
-      "Look up the status of a Stellar transaction by hash via Soroban RPC. Returns SUCCESS, FAILED, or NOT_FOUND along with ledger number, close time, application order, and XDR envelopes. Useful for debugging on-chain registration failures.",
+      "Look up a Stellar transaction by hash via Soroban RPC. Pass wait: true to watch until SUCCESS or FAILED, with bounded timeout and progress notifications; the watch can be canceled. Every result includes the hash and current status, and lookup failures are retryable.",
     inputSchema: {
       type: "object",
       properties: {
@@ -928,6 +963,21 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
             "f47ac10b58cc4372a5670e02b2c3d479c3e5d0a1b2c3d4e5f6a7b8c9d0e1f2a3",
             "3fdba35f04dc8c462986c992bcf875546257113072a909c162f7e470e581e278",
           ],
+        },
+        wait: {
+          type: "boolean",
+          description: "Poll until the transaction reaches SUCCESS or FAILED.",
+        },
+        timeoutMs: {
+          type: "integer",
+          minimum: 0,
+          maximum: 300000,
+          description: "Maximum watch duration in milliseconds (default 60000; maximum 300000).",
+        },
+        intervalMs: {
+          type: "integer",
+          minimum: 200,
+          description: "Delay between status polls in milliseconds (default 2000; minimum 200).",
         },
       },
       required: ["txHash"],
@@ -995,7 +1045,73 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
     annotations: {
       title: "Back Up State",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+    },
+  },
+  {
+    name: "mindvault_preview_state_migration",
+    description:
+      "Read ~/.mindvault/state.json and preview any legacy-to-v1 profile migration without changing it. Reports affected field paths and whether a private recovery backup will be created before applying.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    annotations: {
+      title: "Preview State Migration",
       readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
+  {
+    name: "mindvault_apply_state_migration",
+    description:
+      "Apply the pending legacy-to-v1 profile migration after explicit confirmation. A mode-0600 copy of the original state file is created first; the atomic write leaves the original state intact if applying fails. Omit confirm to preview without writing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        confirm: {
+          type: "boolean",
+          description: "Required to apply the migration; omitted or false only previews it.",
+        },
+      },
+      required: [],
+    },
+    annotations: {
+      title: "Apply State Migration",
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
+  {
+    name: "mindvault_export_state_selective",
+    description:
+      "Export a stable v1 JSON snapshot containing active profile, profile names, and network preferences only. Wallet public keys, private keys, seed phrases, and publisher API keys are excluded.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    annotations: {
+      title: "Export Selective State",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    },
+  },
+  {
+    name: "mindvault_import_state_selective",
+    description:
+      "Import a v1 selective state JSON snapshot. Merges profile names and network preferences while preserving existing wallets and publisher API keys; imported data cannot replace credentials.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        blob: {
+          type: "string",
+          description: "Versioned v1 JSON from mindvault_export_state_selective.",
+        },
+      },
+      required: ["blob"],
+    },
+    annotations: {
+      title: "Import Selective State",
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
     },
@@ -1090,7 +1206,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       title: "Tool Metrics",
       readOnlyHint: false,
       destructiveHint: false,
-      idempotentHint: true,
+      idempotentHint: false,
     },
   },
   {
@@ -1127,6 +1243,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
+      openWorldHint: true,
     },
   },
   {
@@ -1166,6 +1283,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
+      openWorldHint: true,
     },
   },
   {
@@ -1201,12 +1319,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
+      openWorldHint: true,
     },
   },
   {
     name: "mindvault_transfer_ownership",
     description:
-      "Transfer ownership of a registered resource on the vault registry contract to a new creator wallet address (G… key). Only the current resource owner may call this.",
+      "Transfer ownership of a registered resource on the vault registry contract to a new creator wallet address (G… key). Only the current resource owner may call this. Optionally set the incoming owner's terms hash and/or reset the resource's attestation atomically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1219,6 +1338,18 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           type: "string",
           description: "The Stellar public key (G… , 56 chars) of the new resource owner.",
           examples: ["GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH"],
+        },
+        newTermsHash: {
+          type: "string",
+          maxLength: 64,
+          description:
+            "Optional terms hash (up to 64 characters) to bind to the incoming owner in the same transfer.",
+          examples: ["sha256:0123456789abcdef"],
+        },
+        resetAttestation: {
+          type: "boolean",
+          description:
+            "When true, clear the resource's existing attestation hash in the same transfer so it can be re-verified.",
         },
         confirmMainnet: {
           type: "boolean",
@@ -1235,6 +1366,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: false,
+      openWorldHint: true,
     },
   },
   {
@@ -1350,6 +1482,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
+      openWorldHint: true,
     },
   },
   {
@@ -1385,6 +1518,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: true,
+      openWorldHint: true,
     },
   },
   {
@@ -1438,6 +1572,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
+      openWorldHint: true,
     },
   },
   {
@@ -1471,7 +1606,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     inputSchema: { type: "object", properties: {}, required: [] },
     annotations: {
       title: "Pre-warm Catalog Cache",
-      readOnlyHint: true,
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
     },
@@ -1515,7 +1650,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: "mindvault_import_wallet",
     description:
-      "Import an existing Stellar wallet by providing a secret key (or reading MINDVAULT_AGENT_SECRET from the environment). Validates the key, optionally persists it to the active profile (or a named profile), and never logs the secret. Use this to restore a wallet from backup or connect to an existing identity.",
+      "Verify an imported Stellar wallet first, then persist it only after confirming its derived public address, profile, and configured network. The secret is never returned or included in errors.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1527,13 +1662,24 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         },
         profile: {
           type: "string",
-          description: "Optional profile name to import into. Defaults to the active profile.",
+          description: "Profile name to import into. Required when persist is true.",
           examples: ["testnet", "mainnet-publisher"],
+        },
+        network: {
+          type: "string",
+          enum: ["testnet", "mainnet"],
+          description:
+            "Stellar network to bind to the profile. Must match the configured network to persist.",
+        },
+        confirmAddress: {
+          type: "string",
+          description:
+            "Exact public address returned by the verification call; required to persist.",
         },
         persist: {
           type: "boolean",
           description:
-            "When true (default), save the imported wallet to the state file. When false, validate only and return the public key without writing to disk.",
+            "When true, save only after profile, network, and confirmAddress are explicitly supplied. Defaults to false for a verification-only preview.",
           examples: [true, false],
         },
         confirmMainnet: {
@@ -1544,7 +1690,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       },
       required: [],
     },
-    outputSchema: WALLET_SETUP_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
+    outputSchema: WALLET_IMPORT_OUTPUT_SCHEMA as unknown as Record<string, unknown>,
     annotations: {
       title: "Import Wallet",
       readOnlyHint: false,
@@ -1640,7 +1786,8 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           type: "integer",
           minimum: 1,
           maximum: 200,
-          description: "Maximum audit-log entries to include (1–200, default 100). Newest are kept.",
+          description:
+            "Maximum audit-log entries to include (1–200, default 100). Newest are kept.",
           examples: [50, 200],
         },
       },
@@ -1823,6 +1970,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
       readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: false,
+      openWorldHint: true,
     },
   },
 ];

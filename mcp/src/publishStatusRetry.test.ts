@@ -128,4 +128,69 @@ describe("mindvault_publish_status wait: true under retry", () => {
 
     await expect(waitForStatus()).rejects.toThrow(/Publish status verification failed \[503\]/);
   });
+
+  it("stops at a mixed-case 'Rejected' on /verification when /meta keeps returning 503 (#217)", async () => {
+    const { calls } = stubBackend({
+      meta: [meta("pending"), UNAVAILABLE, UNAVAILABLE, UNAVAILABLE],
+      verification: [verification("pending"), verification("Rejected")],
+    });
+
+    const { snapshot, updates } = await waitForStatus();
+
+    expect(snapshot.verificationStatus).toBe("rejected");
+    expect(snapshot.settled).toBe(true);
+    expect(snapshot.timedOut).toBe(false);
+    expect(snapshot.attempts).toBe(2);
+    expect(calls).toEqual(["meta", "verification", "meta", "meta", "meta", "verification"]);
+    expect(updates).toEqual([
+      "Verification pending — poll 1, still waiting.",
+      "Verification rejected after 2 polls.",
+    ]);
+  });
+
+  it("stops immediately when /meta reports rejected even if /verification still returns pending (#217)", async () => {
+    const { calls } = stubBackend({
+      meta: [meta("pending"), meta("rejected")],
+      verification: [verification("pending"), verification("pending")],
+    });
+
+    const { snapshot, updates } = await waitForStatus();
+
+    expect(snapshot.verificationStatus).toBe("rejected");
+    expect(snapshot.settled).toBe(true);
+    expect(snapshot.attempts).toBe(2);
+    expect(calls).toEqual(["meta", "verification", "meta", "verification"]);
+    expect(updates).toEqual([
+      "Verification pending — poll 1, still waiting.",
+      "Verification rejected after 2 polls.",
+    ]);
+  });
+
+  it("stops at a rejection on /meta when /verification exhausts retries with transport errors (#217)", async () => {
+    const metaQueue: Reply[] = [meta("pending"), meta("rejected")];
+    let verCalls = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.endsWith("/meta")) {
+        const next = metaQueue.shift();
+        if (!next) throw new Error(`unexpected extra meta request: ${url}`);
+        return reply(next.status, next.body);
+      }
+      verCalls += 1;
+      if (verCalls === 1) return reply(200, verification("pending").body);
+      throw new Error("fetch failed");
+    });
+
+    const { snapshot, updates } = await waitForStatus();
+
+    expect(snapshot.verificationStatus).toBe("rejected");
+    expect(snapshot.settled).toBe(true);
+    expect(snapshot.attempts).toBe(2);
+    // 1 initial verification call + 3 retried transport attempts on poll 2; nothing after.
+    expect(verCalls).toBe(4);
+    expect(updates).toEqual([
+      "Verification pending — poll 1, still waiting.",
+      "Verification rejected after 2 polls.",
+    ]);
+  });
 });

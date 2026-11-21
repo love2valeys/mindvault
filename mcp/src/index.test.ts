@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 
 const getAttestationHashMock = vi.hoisted(() => vi.fn());
 
@@ -79,22 +82,44 @@ import {
   _setAgentApiKey,
   _resetProfiles,
   _setMockMode,
+  prewarmCatalogCache,
 } from "./index.js";
+import { CORRELATION_HEADER } from "./correlation.js";
 import {
+  getCatalogSnapshot,
   recordCatalogSnapshot,
   recordPreviewSnapshot,
   _clearCatalogCache,
 } from "./catalogCache.js";
 import { Keypair } from "@stellar/stellar-sdk";
+import { _setPurchasesFilePath } from "./purchaseHistory.js";
+import { trackPurchaseAttempt } from "./purchaseStatusLookup.js";
+import { normalizeSettlementWaitPolicy } from "./settlement.js";
+
+const TESTNET_USDC_ISSUER = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
 function mockResponse(data: unknown, ok = true, status = 200): Response {
-  const body = JSON.stringify(data);
+  const responseData =
+    typeof data === "object" &&
+    data !== null &&
+    "balances" in data &&
+    Array.isArray((data as { balances?: unknown }).balances)
+      ? {
+          ...(data as Record<string, unknown>),
+          balances: (data as { balances: any[] }).balances.map((balance) =>
+            balance.asset_code === "USDC" && balance.asset_issuer === undefined
+              ? { ...balance, asset_issuer: TESTNET_USDC_ISSUER }
+              : balance,
+          ),
+        }
+      : data;
+  const body = JSON.stringify(responseData);
   return {
     ok,
     status,
     statusText: ok ? "OK" : "Error",
     text: () => Promise.resolve(body),
-    json: () => Promise.resolve(data),
+    json: () => Promise.resolve(responseData),
     headers: new Headers({ "content-type": "application/json" }),
   } as Response;
 }
@@ -193,12 +218,15 @@ describe("prewarmCatalogCache", () => {
   });
 
   it("reports the resource count and populates the catalog cache", async () => {
-    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
-      Promise.resolve(mockResponse(sampleResources)),
-    );
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(() => Promise.resolve(mockResponse(sampleResources)));
     const result = await prewarmCatalogCache();
     expect(result).toContain("Catalog pre-warmed");
     expect(result).toContain("2 resource(s)");
+    const requestHeaders = fetchSpy.mock.calls[0]?.[1]?.headers as
+      Record<string, string> | undefined;
+    expect(requestHeaders?.[CORRELATION_HEADER]).toMatch(/^mv-[0-9a-z]+-[0-9a-z]{4}$/);
 
     // The offline fallback cache should now be warm — a subsequent transport
     // failure falls back to it rather than throwing outright.
@@ -220,6 +248,34 @@ describe("prewarmCatalogCache", () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Network error"));
     const result = await prewarmCatalogCache();
     expect(result).toContain("Catalog pre-warm failed");
+  });
+
+  it("retries transient gateway errors during revalidation and unpins a stale snapshot (#220)", async () => {
+    recordCatalogSnapshot([{ id: "stale-001", title: "Stale Entry", price: "1.00" }], undefined, 1);
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(mockResponse({ error: "bad gateway" }, false, 502))
+      .mockResolvedValueOnce(mockResponse(sampleResources));
+
+    const result = await prewarmCatalogCache();
+    expect(result).toContain("Catalog pre-warmed");
+    expect(result).toContain("2 resource(s)");
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(getCatalogSnapshot()?.resources).toEqual(sampleResources);
+  });
+
+  it("reports revalidation failure instead of claiming success from an existing stale snapshot (#220)", async () => {
+    recordCatalogSnapshot([{ id: "stale-001", title: "Stale Entry", price: "1.00" }], undefined, 1);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      mockResponse({ error: "unavailable" }, false, 503),
+    );
+
+    const result = await prewarmCatalogCache();
+    expect(result).toContain("Catalog pre-warm failed");
+    // The existing offline snapshot stays preserved for fallback reads.
+    expect(getCatalogSnapshot()?.resources).toEqual([
+      { id: "stale-001", title: "Stale Entry", price: "1.00" },
+    ]);
   });
 });
 
@@ -897,6 +953,7 @@ describe("txStatus", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
   });
 
   it("returns a readable SUCCESS response with ledger and close time", async () => {
@@ -930,6 +987,43 @@ describe("txStatus", () => {
     expect(parsed.message).toContain("not found");
   });
 
+  it("watches a transaction through terminal status with monotonic progress", async () => {
+    vi.useFakeTimers();
+    let poll = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(() =>
+      Promise.resolve(
+        mockResponse({
+          result: {
+            status: poll++ === 0 ? "IN_PROGRESS" : "SUCCESS",
+            ledger: 123456,
+            createdAt: 1700000000,
+          },
+        }),
+      ),
+    );
+    const progress: number[] = [];
+    const pending = txStatus(
+      "abc123",
+      { wait: true, timeoutMs: 1000, intervalMs: 200 },
+      async (step) => {
+        progress.push(step);
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(200);
+    const parsed = JSON.parse(await pending);
+    expect(parsed).toMatchObject({
+      status: "SUCCESS",
+      hash: "abc123",
+      settled: true,
+      timedOut: false,
+      retryable: false,
+      attempts: 2,
+    });
+    expect(progress).toEqual([1, 2]);
+    vi.useRealTimers();
+  });
+
   it("returns a message for an empty hash without calling the RPC", async () => {
     const spy = vi.spyOn(globalThis, "fetch");
     const result = await txStatus("   ");
@@ -959,6 +1053,15 @@ describe("txStatus", () => {
         body: expect.stringContaining("getTransaction"),
       }),
     );
+  });
+});
+
+describe("settlement wait policy", () => {
+  it("supports explicit policies and rejects conflicts with the legacy wait flag", () => {
+    expect(normalizeSettlementWaitPolicy(undefined, "return_after_submit")).toBe(false);
+    expect(normalizeSettlementWaitPolicy(undefined, "wait_for_final_result")).toBe(true);
+    expect(normalizeSettlementWaitPolicy(true, "wait_for_final_result")).toBe(true);
+    expect(() => normalizeSettlementWaitPolicy(true, "return_after_submit")).toThrow(/conflicting/);
   });
 });
 
@@ -1082,6 +1185,66 @@ describe("buy – happy path (402 → sign → retry → success)", () => {
   it("throws when no wallet is configured", async () => {
     _setAgentWallet(null);
     await expect(buy("res-001")).rejects.toThrow("No wallet");
+  });
+});
+
+describe("wallet balances spend summary", () => {
+  it("labels the active-network USDC balance, pending estimate, and configured ceiling", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mindvault-wallet-summary-"));
+    _setPurchasesFilePath(join(dir, "purchases.json"));
+    _resetProfiles();
+    try {
+      const result = await dispatchTool("mindvault_wallet_balances", {});
+      expect(result).toContain("Spend summary (default,");
+      expect(result).toContain("USDC): balance unavailable; estimated pending spend 0;");
+      expect(result).toContain("automatic payment ceiling 10.");
+    } finally {
+      _resetProfiles();
+      _setPurchasesFilePath(null);
+      rmSync(dir, { recursive: true, force: true });
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("estimates pending spend from current listing prices", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mindvault-wallet-pending-"));
+    _setPurchasesFilePath(join(dir, "purchases.json"));
+    _resetProfiles();
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse({ price: "3.25" }));
+    try {
+      await expect(
+        trackPurchaseAttempt("default", "pending-key", "res-pending", false, async () => {
+          throw Object.assign(new Error("Request timed out"), { name: "TimeoutError" });
+        }),
+      ).rejects.toThrow();
+
+      const result = await dispatchTool("mindvault_wallet_balances", {});
+      expect(result).toContain("estimated pending spend 3.25");
+      expect(result).toContain("1/1 purchase attempts priced");
+    } finally {
+      _resetProfiles();
+      _setPurchasesFilePath(null);
+      rmSync(dir, { recursive: true, force: true });
+      vi.restoreAllMocks();
+    }
+  });
+});
+
+describe("Stellar argument validation", () => {
+  it("rejects an invalid address checksum before any API request", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch");
+    try {
+      await expect(
+        dispatchTool("mindvault_register", {
+          name: "Agent",
+          email: "agent@example.com",
+          walletAddress: `G${"A".repeat(55)}`,
+        }),
+      ).rejects.toThrow("walletAddress is not a valid Stellar public address");
+      expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });
 
@@ -1310,6 +1473,22 @@ describe("dry-run – publish validation", () => {
     expect(parsed.steps).toBeDefined();
   });
 
+  it("does not call the content verification endpoint during a dry run", async () => {
+    _setAgentWallet(null);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse({}));
+
+    await dispatchTool("mindvault_publish", {
+      title: "Test Resource",
+      price: "5.00",
+      externalUrl: "https://example.com/data",
+      dryRun: true,
+    });
+
+    expect(fetchSpy.mock.calls.some(([url]) => String(url).includes("/verify-content"))).toBe(
+      false,
+    );
+  });
+
   it("validates title in dry-run", async () => {
     const result = await dispatchTool("mindvault_publish", {
       title: "",
@@ -1408,6 +1587,20 @@ describe("dry-run – buy validation", () => {
     ).rejects.toThrow(/exceeds the automatic payment ceiling/);
   });
 
+  it("allows near-limit casual buys in dry-run when MINDVAULT_MAX_AUTO_PAY_USDC is unset or blank", async () => {
+    for (const envValue of [undefined, "", "   "]) {
+      vi.stubEnv("MINDVAULT_MAX_AUTO_PAY_USDC", envValue);
+      for (const price of ["9.99", "9.9999999", "10.00"]) {
+        vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse({ price }));
+        const result = await dispatchTool("mindvault_buy", {
+          resourceId: "res-001",
+          dryRun: true,
+        });
+        expect(JSON.parse(result).intentions.estimatedPrice).toBe(price);
+      }
+    }
+  });
+
   it("returns dry-run result without submitting payment", async () => {
     const result = await dispatchTool("mindvault_buy", {
       resourceId: "res-001",
@@ -1463,9 +1656,11 @@ describe("registerOnchain – happy path", () => {
   beforeEach(() => {
     _setAgentWallet(testWallet);
     _setAgentApiKey("test-api-key");
+    _setMockMode(true);
   });
 
   afterEach(() => {
+    _setMockMode(false);
     _setAgentWallet(null);
     _setAgentApiKey(null);
     vi.restoreAllMocks();
@@ -1528,9 +1723,11 @@ describe("registerOnchain – error and retry messaging", () => {
   beforeEach(() => {
     _setAgentWallet(testWallet);
     _setAgentApiKey("test-api-key");
+    _setMockMode(true);
   });
 
   afterEach(() => {
+    _setMockMode(false);
     _setAgentWallet(null);
     _setAgentApiKey(null);
     vi.restoreAllMocks();
@@ -2011,6 +2208,33 @@ describe("wallet_info balance details", () => {
     expect(result).toContain("Note: USDC trustline not found");
   });
 
+  it("ignores a counterfeit USDC symbol and reports the canonical issuer balance", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      mockResponse({
+        subentry_count: 2,
+        balances: [
+          {
+            asset_type: "credit_alphanum4",
+            asset_code: "USDC",
+            asset_issuer: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            balance: "999.0",
+          },
+          {
+            asset_type: "credit_alphanum4",
+            asset_code: "USDC",
+            asset_issuer: TESTNET_USDC_ISSUER,
+            balance: "12.5",
+          },
+        ],
+      }),
+    );
+
+    const result = await walletInfo();
+    expect(result).toContain("USDC Balance: 12.5");
+    expect(result).not.toContain("USDC Balance: 999.0");
+    expect(result).toContain("USDC Status: funded");
+  });
+
   it("distinguishes zero USDC balance (trustline exists with 0 balance)", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       mockResponse({
@@ -2487,6 +2711,27 @@ describe("transferOwnership", () => {
     }
   });
 
+  it("includes optional handoff details in mock mode", async () => {
+    _setAgentWallet({
+      publicKey: "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH",
+      secretKey: "SD1234567890123456789012345678901234567890123456789012345",
+    });
+    process.env.MINDVAULT_MOCK = "1";
+    try {
+      const res = await transferOwnership(
+        "res-001",
+        "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH",
+        "sha256:0123456789abcdef",
+        true,
+      );
+      const parsed = JSON.parse(res);
+      expect(parsed.newTermsHash).toBe("sha256:0123456789abcdef");
+      expect(parsed.attestationReset).toBe(true);
+    } finally {
+      delete process.env.MINDVAULT_MOCK;
+    }
+  });
+
   it("dispatches through dispatchTool with valid arguments", async () => {
     _setAgentWallet({
       publicKey: "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH",
@@ -2497,8 +2742,13 @@ describe("transferOwnership", () => {
       const res = await dispatchTool("mindvault_transfer_ownership", {
         resourceId: "res-001",
         newCreator: "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH",
+        newTermsHash: "sha256:0123456789abcdef",
+        resetAttestation: true,
       });
-      expect(res).toContain("success");
+      const parsed = JSON.parse(res);
+      expect(parsed.status).toBe("success");
+      expect(parsed.newTermsHash).toBe("sha256:0123456789abcdef");
+      expect(parsed.attestationReset).toBe(true);
     } finally {
       delete process.env.MINDVAULT_MOCK;
     }
@@ -2741,6 +2991,20 @@ describe("setTags (#832)", () => {
     try {
       const res = await dispatchTool("mindvault_set_tags", { resourceId: "res-001", tags: [] });
       expect(res).toContain("Tags: (none)");
+    } finally {
+      delete process.env.MINDVAULT_MOCK;
+    }
+  });
+
+  it("normalizes and deduplicates tags when setTags is called directly", async () => {
+    _setAgentWallet({
+      publicKey: "GA6HCMBLTZS5VYYBCATRBRZ3BZJMAFUDKYYF6AH6MVCMGWMRDNSWJPIH",
+      secretKey: "SD1234567890123456789012345678901234567890123456789012345",
+    });
+    process.env.MINDVAULT_MOCK = "1";
+    try {
+      const res = await setTags("res-001", ["  AI ", "ai", "Dataset"]);
+      expect(res).toContain("Tags: ai, dataset");
     } finally {
       delete process.env.MINDVAULT_MOCK;
     }
@@ -3029,6 +3293,30 @@ describe("offline catalog cache fallback (#556)", () => {
     expect(out).toContain("cached");
   });
 
+  it("coalesces concurrent reads for the same catalog URL", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse([catalogItem]));
+
+    const [first, second] = await Promise.all([browse(), browse()]);
+
+    expect(first).toContain("[c1] Cached One");
+    expect(second).toContain("[c1] Cached One");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("coalesces a failed read but does not retain it for later calls", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(mockResponse({ error: "bad request" }, false, 400));
+
+    const results = await Promise.allSettled([browse(), browse()]);
+
+    expect(results.every((result) => result.status === "rejected")).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+    await expect(browse()).rejects.toThrow(/bad request/);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
   it("search applies filters to the cached snapshot and labels it when offline", async () => {
     recordCatalogSnapshot([catalogItem]);
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ECONNREFUSED"));
@@ -3056,6 +3344,25 @@ describe("offline catalog cache fallback (#556)", () => {
     const parsed = JSON.parse(await preview("res-9"));
     expect(parsed.title).toBe("Cached Preview");
     expect(parsed.offlineCache).toContain("Offline catalog snapshot served");
+  });
+
+  it("coalesces concurrent preview misses for the same resource", async () => {
+    const previewMeta = {
+      id: "res-shared",
+      title: "Shared Preview",
+      price: "4",
+      description: "D",
+      resourceType: "article",
+      verificationStatus: "verified",
+      accessUrl: "https://example.com/shared",
+    };
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse(previewMeta));
+
+    const [first, second] = await Promise.all([preview("res-shared"), preview("res-shared")]);
+
+    expect(JSON.parse(first).title).toBe("Shared Preview");
+    expect(JSON.parse(second).title).toBe("Shared Preview");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
   it("serves the snapshot for a gateway error the retry layer could not ride out", async () => {

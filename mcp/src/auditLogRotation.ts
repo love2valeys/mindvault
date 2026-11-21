@@ -23,8 +23,19 @@
  * infrequent relative to the network calls they describe.
  */
 
-import { appendFileSync, existsSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { dirname } from "node:path";
+import { Mutex } from "./mutex.js";
 
 /** Environment variables controlling the file sink. */
 export const AUDIT_FILE_ENV_VARS = {
@@ -95,8 +106,17 @@ export function formatJsonl(entry: unknown): string {
   return `${JSON.stringify(entry)}\n`;
 }
 
+type PendingOp = { kind: "write"; line: string; bytes: number } | { kind: "rotate" };
+
 /**
  * Appends JSONL entries to a file, rotating it by size.
+ *
+ * Appends and rotations are strictly serialized so a rotation can never
+ * truncate or rename while a concurrent append holds the mutex or while a
+ * reader holds a read lock (#213). Operations that arrive while a read lock or
+ * exclusive section is active are buffered in FIFO order and flushed — with
+ * the live file fsynced before rename — so tail entries always land in the
+ * rotated generation and are never dropped.
  *
  * The writer tolerates a filesystem that refuses it. A read-only directory or
  * a full disk disables the sink and is reported once through `onError`; it
@@ -109,6 +129,12 @@ export class RotatingJsonlWriter {
   private size = 0;
   private ready = false;
   private disabled = false;
+  private readonly mutex = new Mutex();
+  private activeReaders = 0;
+  private readerDrainResolvers: Array<() => void> = [];
+  private inCriticalSection = false;
+  private mutexHeld = false;
+  private pendingOps: PendingOp[] = [];
   private readonly onError: (error: unknown) => void;
 
   constructor(config: RotationConfig, onError: (error: unknown) => void = () => {}) {
@@ -126,6 +152,48 @@ export class RotatingJsonlWriter {
     return this.size;
   }
 
+  /** Number of active read locks currently deferring rotation/writes. */
+  get readerCount(): number {
+    return this.activeReaders;
+  }
+
+  /** Number of buffered operations waiting for active locks to release. */
+  get pendingCount(): number {
+    return this.pendingOps.length;
+  }
+
+  /**
+   * Run a synchronous reader while holding a shared read lock.
+   *
+   * Rotation and file-mutating writes that cross this read lock are deferred
+   * in FIFO order rather than truncating or renaming out from under the reader,
+   * and flushed as soon as the last read lock releases (#213).
+   */
+  withReadLockSync<T>(fn: () => T): T {
+    this.activeReaders += 1;
+    try {
+      return fn();
+    } finally {
+      this.releaseReadLock();
+    }
+  }
+
+  /**
+   * Run an async reader while holding a shared read lock.
+   *
+   * Multiple readers may overlap; rotation and appends serialize cleanly after
+   * the final reader completes and flush all pending tail entries into the
+   * rotated file (#213).
+   */
+  async withReadLock<T>(fn: () => T | Promise<T>): Promise<T> {
+    this.activeReaders += 1;
+    try {
+      return await fn();
+    } finally {
+      this.releaseReadLock();
+    }
+  }
+
   /**
    * Append one entry.
    *
@@ -141,19 +209,162 @@ export class RotatingJsonlWriter {
     const line = formatJsonl(entry);
     const bytes = Buffer.byteLength(line, "utf-8");
 
-    try {
-      this.ensureReady();
-      if (this.size > 0 && this.size + bytes > this.config.maxBytes) {
-        this.rotate();
+    if (this.activeReaders > 0 || this.inCriticalSection || this.mutexHeld) {
+      this.pendingOps.push({ kind: "write", line, bytes });
+      return;
+    }
+
+    this.runSerializedSync(() => {
+      this.executeWrite(line, bytes);
+    });
+  }
+
+  /**
+   * Append one entry serialized through the writer's exclusive mutex.
+   *
+   * Waits for any active read locks and preceding mutex holders, flushes any
+   * queued tail operations in order, and guarantees the entry is on disk when
+   * the returned promise resolves (#213).
+   */
+  async writeAsync(entry: unknown): Promise<void> {
+    if (this.disabled) return;
+
+    const line = formatJsonl(entry);
+    const bytes = Buffer.byteLength(line, "utf-8");
+
+    await this.mutex.runExclusive(async () => {
+      if (this.disabled) return;
+      this.mutexHeld = true;
+      try {
+        while (this.activeReaders > 0) {
+          await this.waitForNoReaders();
+        }
+        if (this.disabled) return;
+        this.runSerializedSync(() => {
+          this.drainPendingOpsUnlocked();
+          this.executeWrite(line, bytes);
+        });
+      } finally {
+        this.mutexHeld = false;
+        if (this.activeReaders === 0 && !this.inCriticalSection && this.pendingOps.length > 0) {
+          this.drainPendingOps();
+        }
       }
-      appendFileSync(this.config.path, line, { encoding: "utf-8" });
-      this.size += bytes;
+    });
+  }
+
+  /**
+   * Trigger a rotation synchronously, or queue it if a read lock or exclusive
+   * append currently holds the writer (#213).
+   */
+  rotate(): void {
+    if (this.disabled) return;
+
+    if (this.activeReaders > 0 || this.inCriticalSection || this.mutexHeld) {
+      this.pendingOps.push({ kind: "rotate" });
+      return;
+    }
+
+    this.runSerializedSync(() => {
+      this.rotateNow();
+    });
+  }
+
+  /**
+   * Rotate the live log file serialized with concurrent appends and read locks.
+   *
+   * Waits for any active append holding the mutex and any active read locks,
+   * flushes all buffered tail entries into the live file and fsyncs it, then
+   * shifts generations so the complete tail is preserved in `.1` (#213).
+   */
+  async rotateAsync(): Promise<void> {
+    if (this.disabled) return;
+
+    await this.mutex.runExclusive(async () => {
+      if (this.disabled) return;
+      this.mutexHeld = true;
+      try {
+        while (this.activeReaders > 0) {
+          await this.waitForNoReaders();
+        }
+        if (this.disabled) return;
+        this.runSerializedSync(() => {
+          this.drainPendingOpsUnlocked();
+          this.rotateNow();
+        });
+      } finally {
+        this.mutexHeld = false;
+        if (this.activeReaders === 0 && !this.inCriticalSection && this.pendingOps.length > 0) {
+          this.drainPendingOps();
+        }
+      }
+    });
+  }
+
+  private waitForNoReaders(): Promise<void> {
+    if (this.activeReaders === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      this.readerDrainResolvers.push(resolve);
+    });
+  }
+
+  private notifyReadersDrained(): void {
+    if (this.readerDrainResolvers.length === 0) return;
+    const resolvers = this.readerDrainResolvers.splice(0);
+    for (const resolve of resolvers) resolve();
+  }
+
+  private releaseReadLock(): void {
+    this.activeReaders = Math.max(0, this.activeReaders - 1);
+    if (this.activeReaders > 0) return;
+    this.notifyReadersDrained();
+    if (!this.inCriticalSection && !this.mutexHeld && this.pendingOps.length > 0) {
+      this.drainPendingOps();
+    }
+  }
+
+  private runSerializedSync(fn: () => void): void {
+    this.inCriticalSection = true;
+    try {
+      fn();
+      this.drainPendingOpsUnlocked();
     } catch (error) {
       // One report, then silence: a broken disk must not turn every
       // subsequent tool call into a second error message.
       this.disabled = true;
+      this.pendingOps = [];
       this.onError(error);
+    } finally {
+      this.inCriticalSection = false;
     }
+  }
+
+  private drainPendingOps(): void {
+    if (this.disabled || this.activeReaders > 0 || this.inCriticalSection) return;
+    this.runSerializedSync(() => {
+      this.drainPendingOpsUnlocked();
+    });
+  }
+
+  private drainPendingOpsUnlocked(): void {
+    while (!this.disabled && this.activeReaders === 0 && this.pendingOps.length > 0) {
+      const op = this.pendingOps.shift()!;
+      if (op.kind === "write") {
+        this.executeWrite(op.line, op.bytes);
+      } else {
+        this.rotateNow();
+      }
+    }
+  }
+
+  private executeWrite(line: string, bytes: number): void {
+    this.ensureReady();
+    this.size = existsSync(this.config.path) ? statSync(this.config.path).size : 0;
+    if (this.size > 0 && this.size + bytes > this.config.maxBytes) {
+      this.rotateNow();
+    }
+    appendFileSync(this.config.path, line, { encoding: "utf-8" });
+    this.size += bytes;
   }
 
   /** Create the directory and adopt the size of any existing log. */
@@ -171,6 +382,17 @@ export class RotatingJsonlWriter {
     this.ready = true;
   }
 
+  /** Flush buffered OS writes to the live file before moving it to `.1`. */
+  private flushFile(path: string): void {
+    if (!existsSync(path)) return;
+    const fd = openSync(path, "r+");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
   /**
    * Shift every generation up by one and free the live path.
    *
@@ -178,11 +400,19 @@ export class RotatingJsonlWriter {
    * yet. With `maxFiles` of 0 the live file is simply discarded, which is the
    * "keep only what is current" configuration.
    */
-  private rotate(): void {
+  private rotateNow(): void {
+    this.ensureReady();
     const { path, maxFiles } = this.config;
-    // Rotation is serialized with append: re-stat first so any tail written by a
-    // concurrent append is carried into the rotated generation, never truncated (#844).
-    this.size = existsSync(path) ? statSync(path).size : 0;
+    // Rotation is serialized with append and read locks: re-stat and fsync
+    // first so every tail entry written before rotation is carried intact into
+    // the rotated generation, never truncated (#213).
+    const currentBytes = existsSync(path) ? statSync(path).size : 0;
+    if (currentBytes === 0) {
+      this.size = 0;
+      return;
+    }
+
+    this.flushFile(path);
 
     if (maxFiles <= 0) {
       rmSync(path, { force: true });

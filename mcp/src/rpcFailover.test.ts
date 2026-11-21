@@ -445,3 +445,103 @@ describe("describeFailover", () => {
     expect(describeFailover(instance)).toContain("maxAttempts=2");
   });
 });
+
+describe("RpcFailover – Horizon balance fallback unit normalization (#219)", () => {
+  const HORIZON = "https://horizon.example";
+
+  it("returns identical canonical USDC and stroops whether answered by Soroban or Horizon fallback", async () => {
+    const { instance: healthy } = failover([PRIMARY]);
+    const readHorizon = vi.fn().mockResolvedValue({ balance: "12.5000000" });
+
+    const fromSoroban = await healthy.runBalanceWithHorizonFallback({
+      readSoroban: vi.fn().mockResolvedValue({ status: 200, stroops: 125_000_000n }),
+      horizonEndpoint: HORIZON,
+      readHorizon,
+    });
+    expect(readHorizon).not.toHaveBeenCalled();
+
+    const { instance: failing } = failover([PRIMARY, SECONDARY]);
+    const fromHorizon = await failing.runBalanceWithHorizonFallback({
+      readSoroban: vi.fn().mockResolvedValue({ status: 503 }),
+      horizonEndpoint: HORIZON,
+      readHorizon,
+    });
+
+    expect(fromSoroban.source).toBe("soroban");
+    expect(fromSoroban.usedHorizonFallback).toBe(false);
+    expect(fromHorizon.source).toBe("horizon");
+    expect(fromHorizon.usedHorizonFallback).toBe(true);
+    expect(fromHorizon.endpoint).toBe(HORIZON);
+    expect(fromHorizon.attempts).toHaveLength(2);
+
+    // Crucial regression invariant: failing over from Soroban to Horizon must
+    // preserve exact USDC units (never off by 10x or 10^7x).
+    expect(fromHorizon.usdc).toBe(fromSoroban.usdc);
+    expect(fromHorizon.stroops).toBe(fromSoroban.stroops);
+    expect(fromHorizon.usdc).toBe("12.5000000");
+    expect(fromHorizon.stroops).toBe(125_000_000n);
+  });
+
+  it("rescales 6-decimal Soroban USDC readings to match Horizon's 7-decimal stroops", async () => {
+    const { instance } = failover([PRIMARY]);
+    const fromSoroban6 = await instance.runBalanceWithHorizonFallback({
+      readSoroban: vi.fn().mockResolvedValue({ status: 200, stroops: 25_000_000n, decimals: 6 }),
+      horizonEndpoint: HORIZON,
+      readHorizon: vi.fn(),
+    });
+
+    const { instance: failing } = failover([PRIMARY]);
+    const fromHorizon = await failing.runBalanceWithHorizonFallback({
+      readSoroban: vi
+        .fn()
+        .mockRejectedValue(
+          Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }),
+        ),
+      horizonEndpoint: HORIZON,
+      readHorizon: vi.fn().mockResolvedValue({ balance: "25.0000000" }),
+    });
+
+    expect(fromSoroban6.usdc).toBe("25.0000000");
+    expect(fromSoroban6.stroops).toBe(250_000_000n);
+    expect(fromHorizon.usdc).toBe(fromSoroban6.usdc);
+    expect(fromHorizon.stroops).toBe(fromSoroban6.stroops);
+  });
+
+  it("rethrows non-failover errors instead of falling back to Horizon", async () => {
+    const { instance } = failover([PRIMARY, SECONDARY]);
+    const readHorizon = vi.fn().mockResolvedValue({ balance: "1.0000000" });
+
+    await expect(
+      instance.runBalanceWithHorizonFallback({
+        readSoroban: vi.fn().mockRejectedValue(new SyntaxError("bad JSON")),
+        horizonEndpoint: HORIZON,
+        readHorizon,
+      }),
+    ).rejects.toThrow(SyntaxError);
+    expect(readHorizon).not.toHaveBeenCalled();
+  });
+
+  it("throws rather than returning a silent wrong balance when Horizon fallback returns malformed data", async () => {
+    const { instance } = failover([PRIMARY]);
+
+    await expect(
+      instance.runBalanceWithHorizonFallback({
+        readSoroban: vi.fn().mockResolvedValue({ status: 503 }),
+        horizonEndpoint: HORIZON,
+        readHorizon: vi.fn().mockResolvedValue({ balance: "not-a-number" }),
+      }),
+    ).rejects.toThrow(/Horizon fallback balance/);
+  });
+
+  it("throws when Soroban returns a non-failover HTTP error without stroops", async () => {
+    const { instance } = failover([PRIMARY]);
+
+    await expect(
+      instance.runBalanceWithHorizonFallback({
+        readSoroban: vi.fn().mockResolvedValue({ status: 400 }),
+        horizonEndpoint: HORIZON,
+        readHorizon: vi.fn(),
+      }),
+    ).rejects.toThrow(/did not include a bigint stroops balance/);
+  });
+});
